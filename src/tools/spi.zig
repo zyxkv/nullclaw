@@ -171,19 +171,19 @@ pub const SpiTool = struct {
 
         // Set SPI mode
         var mode_val: u8 = mode;
-        if (std.posix.ioctl(fd, SPI_IOC_WR_MODE, @intFromPtr(&mode_val)) != 0) {
+        if (std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, SPI_IOC_WR_MODE), @intFromPtr(&mode_val)) != 0) {
             return ToolResult.fail("Failed to set SPI mode");
         }
 
         // Set bits per word
         var bpw: u8 = bits_per_word;
-        if (std.posix.ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, @intFromPtr(&bpw)) != 0) {
+        if (std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, SPI_IOC_WR_BITS_PER_WORD), @intFromPtr(&bpw)) != 0) {
             return ToolResult.fail("Failed to set bits per word");
         }
 
         // Set speed
         var spd: u32 = speed_hz;
-        if (std.posix.ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, @intFromPtr(&spd)) != 0) {
+        if (std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, SPI_IOC_WR_MAX_SPEED_HZ), @intFromPtr(&spd)) != 0) {
             return ToolResult.fail("Failed to set SPI speed");
         }
 
@@ -220,7 +220,7 @@ pub const SpiTool = struct {
             .pad = 0,
         };
 
-        if (std.posix.ioctl(fd, SPI_IOC_MESSAGE_1, @intFromPtr(&transfer)) != 0) {
+        if (std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, SPI_IOC_MESSAGE_1), @intFromPtr(&transfer)) != 0) {
             return ToolResult.fail("SPI transfer failed");
         }
 

@@ -206,7 +206,7 @@ pub const I2cTool = struct {
         defer std.posix.close(fd);
 
         // Set slave address
-        const rc = std.os.linux.syscall(.ioctl, .{ @as(usize, @intCast(fd)), @as(usize, I2C_SLAVE), @as(usize, addr) });
+        const rc = std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, I2C_SLAVE), @as(usize, addr));
         const signed_rc: isize = @bitCast(rc);
         if (signed_rc < 0)
             return ToolResult.fail("Failed to set I2C slave address");
@@ -260,7 +260,7 @@ pub const I2cTool = struct {
         defer std.posix.close(fd);
 
         // Set slave address
-        const rc = std.os.linux.syscall(.ioctl, .{ @as(usize, @intCast(fd)), @as(usize, I2C_SLAVE), @as(usize, addr) });
+        const rc = std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, I2C_SLAVE), @as(usize, addr));
         const signed_rc: isize = @bitCast(rc);
         if (signed_rc < 0)
             return ToolResult.fail("Failed to set I2C slave address");
