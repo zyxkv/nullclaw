@@ -307,9 +307,308 @@ pub fn createObserver(backend: []const u8) []const u8 {
     if (std.mem.eql(u8, backend, "verbose")) return "verbose";
     if (std.mem.eql(u8, backend, "file")) return "file";
     if (std.mem.eql(u8, backend, "multi")) return "multi";
+    if (std.mem.eql(u8, backend, "otel") or std.mem.eql(u8, backend, "otlp")) return "otel";
     if (std.mem.eql(u8, backend, "none") or std.mem.eql(u8, backend, "noop")) return "noop";
     return "noop"; // fallback
 }
+
+// ── OtelObserver ─────────────────────────────────────────────────────
+
+/// OpenTelemetry key-value attribute.
+pub const OtelAttribute = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// A single OTLP span with timing and attributes.
+pub const OtelSpan = struct {
+    trace_id: [32]u8,
+    span_id: [16]u8,
+    name: []const u8,
+    start_ns: u64,
+    end_ns: u64,
+    attributes: std.ArrayListUnmanaged(OtelAttribute),
+
+    pub fn deinit(self: *OtelSpan, allocator: std.mem.Allocator) void {
+        self.attributes.deinit(allocator);
+    }
+};
+
+const http_util = @import("http_util.zig");
+
+/// OpenTelemetry OTLP/HTTP observer — batches spans and exports via JSON.
+pub const OtelObserver = struct {
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    service_name: []const u8,
+    spans: std.ArrayListUnmanaged(OtelSpan),
+    mutex: std.Thread.Mutex,
+    current_trace_id: [32]u8,
+    current_start_ns: u64,
+
+    const max_batch_size: usize = 50;
+
+    const vtable_impl = Observer.VTable{
+        .record_event = otelRecordEvent,
+        .record_metric = otelRecordMetric,
+        .flush = otelFlush,
+        .name = otelName,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, endpoint: ?[]const u8, service_name: ?[]const u8) OtelObserver {
+        return .{
+            .allocator = allocator,
+            .endpoint = endpoint orelse "http://localhost:4318",
+            .service_name = service_name orelse "nullclaw",
+            .spans = .empty,
+            .mutex = .{},
+            .current_trace_id = .{0} ** 32,
+            .current_start_ns = 0,
+        };
+    }
+
+    pub fn observer(self: *OtelObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_impl,
+        };
+    }
+
+    pub fn deinit(self: *OtelObserver) void {
+        for (self.spans.items) |*span| {
+            span.deinit(self.allocator);
+        }
+        self.spans.deinit(self.allocator);
+    }
+
+    fn resolve(ptr: *anyopaque) *OtelObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    /// Generate random hex ID into a buffer.
+    fn randomHex(buf: []u8) void {
+        var raw: [16]u8 = undefined;
+        const needed = buf.len / 2;
+        std.crypto.random.bytes(raw[0..needed]);
+        const hex = "0123456789abcdef";
+        for (0..needed) |i| {
+            buf[i * 2] = hex[raw[i] >> 4];
+            buf[i * 2 + 1] = hex[raw[i] & 0x0f];
+        }
+    }
+
+    fn nowNs() u64 {
+        return @intCast(std.time.nanoTimestamp());
+    }
+
+    fn addSpan(self: *OtelObserver, name: []const u8, start_ns: u64, end_ns: u64, attrs: []const OtelAttribute) void {
+        var span_id: [16]u8 = undefined;
+        randomHex(&span_id);
+
+        var attributes: std.ArrayListUnmanaged(OtelAttribute) = .empty;
+        for (attrs) |attr| {
+            attributes.append(self.allocator, attr) catch break;
+        }
+
+        self.spans.append(self.allocator, .{
+            .trace_id = self.current_trace_id,
+            .span_id = span_id,
+            .name = name,
+            .start_ns = start_ns,
+            .end_ns = end_ns,
+            .attributes = attributes,
+        }) catch return;
+
+        if (self.spans.items.len >= max_batch_size) {
+            self.flushLocked();
+        }
+    }
+
+    fn otelRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = nowNs();
+
+        switch (event.*) {
+            .agent_start => |e| {
+                randomHex(&self.current_trace_id);
+                self.current_start_ns = now;
+                self.addSpan("agent.start", now, now, &.{
+                    .{ .key = "provider", .value = e.provider },
+                    .{ .key = "model", .value = e.model },
+                });
+            },
+            .agent_end => |e| {
+                const start = if (self.current_start_ns > 0) self.current_start_ns else now;
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                self.addSpan("agent.end", start, now, &.{
+                    .{ .key = "duration_ms", .value = dur_str },
+                });
+            },
+            .llm_request => |e| {
+                self.addSpan("llm.request", now, now, &.{
+                    .{ .key = "provider", .value = e.provider },
+                    .{ .key = "model", .value = e.model },
+                });
+            },
+            .llm_response => |e| {
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                self.addSpan("llm.response", now -| (e.duration_ms * 1_000_000), now, &.{
+                    .{ .key = "provider", .value = e.provider },
+                    .{ .key = "model", .value = e.model },
+                    .{ .key = "duration_ms", .value = dur_str },
+                    .{ .key = "success", .value = if (e.success) "true" else "false" },
+                });
+            },
+            .tool_call_start => |e| {
+                self.addSpan("tool.start", now, now, &.{
+                    .{ .key = "tool", .value = e.tool },
+                });
+            },
+            .tool_call => |e| {
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, &.{
+                    .{ .key = "tool", .value = e.tool },
+                    .{ .key = "duration_ms", .value = dur_str },
+                    .{ .key = "success", .value = if (e.success) "true" else "false" },
+                });
+            },
+            .turn_complete => {
+                self.addSpan("turn.complete", now, now, &.{});
+            },
+            .channel_message => |e| {
+                self.addSpan("channel.message", now, now, &.{
+                    .{ .key = "channel", .value = e.channel },
+                    .{ .key = "direction", .value = e.direction },
+                });
+            },
+            .heartbeat_tick => {
+                self.addSpan("heartbeat.tick", now, now, &.{});
+            },
+            .err => |e| {
+                self.addSpan("error", now, now, &.{
+                    .{ .key = "component", .value = e.component },
+                    .{ .key = "message", .value = e.message },
+                });
+            },
+        }
+    }
+
+    fn otelRecordMetric(ptr: *anyopaque, metric: *const ObserverMetric) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = nowNs();
+
+        switch (metric.*) {
+            .request_latency_ms => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.request_latency_ms", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .tokens_used => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.tokens_used", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .active_sessions => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.active_sessions", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .queue_depth => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.queue_depth", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+        }
+    }
+
+    /// Serialize all pending spans as OTLP/HTTP JSON payload.
+    pub fn serializeSpans(self: *OtelObserver) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+
+        try w.writeAll("{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"");
+        try w.writeAll(self.service_name);
+        try w.writeAll("\"}}]},\"scopeSpans\":[{\"spans\":[");
+
+        for (self.spans.items, 0..) |span, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"traceId\":\"");
+            try w.writeAll(&span.trace_id);
+            try w.writeAll("\",\"spanId\":\"");
+            try w.writeAll(&span.span_id);
+            try w.writeAll("\",\"name\":\"");
+            try w.writeAll(span.name);
+            try w.writeAll("\",\"startTimeUnixNano\":\"");
+            try w.print("{d}", .{span.start_ns});
+            try w.writeAll("\",\"endTimeUnixNano\":\"");
+            try w.print("{d}", .{span.end_ns});
+            try w.writeAll("\",\"attributes\":[");
+
+            for (span.attributes.items, 0..) |attr, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.writeAll("{\"key\":\"");
+                try w.writeAll(attr.key);
+                try w.writeAll("\",\"value\":{\"stringValue\":\"");
+                try w.writeAll(attr.value);
+                try w.writeAll("\"}}");
+            }
+
+            try w.writeAll("]}");
+        }
+
+        try w.writeAll("]}]}]}");
+
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Flush pending spans to the OTLP endpoint. Caller must hold the mutex.
+    fn flushLocked(self: *OtelObserver) void {
+        if (self.spans.items.len == 0) return;
+
+        const payload = self.serializeSpans() catch return;
+        defer self.allocator.free(payload);
+
+        const url_buf = std.fmt.allocPrint(self.allocator, "{s}/v1/traces", .{self.endpoint}) catch return;
+        defer self.allocator.free(url_buf);
+
+        _ = http_util.curlPost(self.allocator, url_buf, payload, &.{}) catch {};
+
+        // Clear flushed spans
+        for (self.spans.items) |*span| {
+            span.deinit(self.allocator);
+        }
+        self.spans.clearRetainingCapacity();
+    }
+
+    fn otelFlush(ptr: *anyopaque) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.flushLocked();
+    }
+
+    fn otelName(_: *anyopaque) []const u8 {
+        return "otel";
+    }
+};
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -408,6 +707,8 @@ test "createObserver factory" {
     try std.testing.expectEqualStrings("verbose", createObserver("verbose"));
     try std.testing.expectEqualStrings("file", createObserver("file"));
     try std.testing.expectEqualStrings("multi", createObserver("multi"));
+    try std.testing.expectEqualStrings("otel", createObserver("otel"));
+    try std.testing.expectEqualStrings("otel", createObserver("otlp"));
     try std.testing.expectEqualStrings("noop", createObserver("none"));
     try std.testing.expectEqualStrings("noop", createObserver("noop"));
     try std.testing.expectEqualStrings("noop", createObserver("unknown_backend"));
@@ -621,4 +922,245 @@ test "Observer interface dispatches correctly" {
     for (observers, expected_names) |obs, name| {
         try std.testing.expectEqualStrings(name, obs.getName());
     }
+}
+
+// ── OtelObserver tests ──────────────────────────────────────────
+
+test "OtelObserver name" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+    try std.testing.expectEqualStrings("otel", obs.getName());
+}
+
+test "OtelObserver init defaults" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    try std.testing.expectEqualStrings("http://localhost:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("nullclaw", otel.service_name);
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+}
+
+test "OtelObserver init custom endpoint" {
+    var otel = OtelObserver.init(std.testing.allocator, "http://otel:4318", "myservice");
+    defer otel.deinit();
+    try std.testing.expectEqualStrings("http://otel:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("myservice", otel.service_name);
+}
+
+test "OtelObserver span building on agent_start" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    obs.recordEvent(&event);
+
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
+    // trace_id should be set (not all zeros)
+    var all_zero = true;
+    for (otel.current_trace_id) |b| {
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!all_zero);
+}
+
+test "OtelObserver span building on all event types" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const events = [_]ObserverEvent{
+        .{ .agent_start = .{ .provider = "test", .model = "test" } },
+        .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
+        .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
+        .{ .tool_call_start = .{ .tool = "shell" } },
+        .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
+        .{ .turn_complete = {} },
+        .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
+        .{ .heartbeat_tick = {} },
+        .{ .err = .{ .component = "test", .message = "oops" } },
+        .{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), otel.spans.items.len);
+    try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("llm.request", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("llm.response", otel.spans.items[2].name);
+    try std.testing.expectEqualStrings("tool.start", otel.spans.items[3].name);
+    try std.testing.expectEqualStrings("tool.call", otel.spans.items[4].name);
+    try std.testing.expectEqualStrings("turn.complete", otel.spans.items[5].name);
+    try std.testing.expectEqualStrings("channel.message", otel.spans.items[6].name);
+    try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[7].name);
+    try std.testing.expectEqualStrings("error", otel.spans.items[8].name);
+    try std.testing.expectEqualStrings("agent.end", otel.spans.items[9].name);
+}
+
+test "OtelObserver span attributes" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    try std.testing.expectEqual(@as(usize, 2), span.attributes.items.len);
+    try std.testing.expectEqualStrings("provider", span.attributes.items[0].key);
+    try std.testing.expectEqualStrings("openrouter", span.attributes.items[0].value);
+    try std.testing.expectEqualStrings("model", span.attributes.items[1].key);
+    try std.testing.expectEqualStrings("claude", span.attributes.items[1].value);
+}
+
+test "OtelObserver JSON serialization" {
+    var otel = OtelObserver.init(std.testing.allocator, null, "test-svc");
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .agent_start = .{ .provider = "test", .model = "m1" } };
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    // Verify overall structure
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"test-svc\"}}]}"));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent.start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"traceId\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"spanId\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"startTimeUnixNano\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"endTimeUnixNano\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"key\":\"provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stringValue\":\"test\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, json, "]}]}]}"));
+}
+
+test "OtelObserver JSON multiple spans" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const e1 = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&e1);
+    const e2 = ObserverEvent{ .turn_complete = {} };
+    obs.recordEvent(&e2);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    // Two spans separated by comma
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent.start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"turn.complete\"") != null);
+}
+
+test "OtelObserver batch flush at 50 spans" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // Record 49 events — should not flush (curl will fail but spans stay)
+    for (0..49) |_| {
+        const event = ObserverEvent{ .heartbeat_tick = {} };
+        obs.recordEvent(&event);
+    }
+    try std.testing.expectEqual(@as(usize, 49), otel.spans.items.len);
+
+    // 50th event triggers flush attempt (curl fails, spans get cleared anyway)
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    // After flush attempt (curl fails), spans are cleared
+    // The 50th span triggers addSpan which calls flushLocked clearing all spans
+    // But the 50th span is added BEFORE the flush check, so it's included in the flush
+    try std.testing.expect(otel.spans.items.len < 50);
+}
+
+test "OtelObserver metrics create spans" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const m1 = ObserverMetric{ .request_latency_ms = 42 };
+    obs.recordMetric(&m1);
+    const m2 = ObserverMetric{ .tokens_used = 100 };
+    obs.recordMetric(&m2);
+    const m3 = ObserverMetric{ .active_sessions = 3 };
+    obs.recordMetric(&m3);
+    const m4 = ObserverMetric{ .queue_depth = 7 };
+    obs.recordMetric(&m4);
+
+    try std.testing.expectEqual(@as(usize, 4), otel.spans.items.len);
+    try std.testing.expectEqualStrings("metric.request_latency_ms", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("metric.tokens_used", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("metric.active_sessions", otel.spans.items[2].name);
+    try std.testing.expectEqualStrings("metric.queue_depth", otel.spans.items[3].name);
+}
+
+test "OtelObserver flush empty is noop" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+    // Flush with no spans should not panic or leak
+    obs.flush();
+}
+
+test "OtelObserver randomHex produces valid hex" {
+    var buf: [32]u8 = undefined;
+    OtelObserver.randomHex(&buf);
+    for (buf) |c| {
+        try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+}
+
+test "OtelObserver span timing" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    try std.testing.expect(span.start_ns > 0);
+    try std.testing.expect(span.end_ns >= span.start_ns);
+}
+
+test "OtelObserver llm_response has duration-adjusted start" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .llm_response = .{
+        .provider = "p",
+        .model = "m",
+        .duration_ms = 100,
+        .success = true,
+        .error_message = null,
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    // start should be earlier than end by ~100ms
+    try std.testing.expect(span.end_ns >= span.start_ns);
+    try std.testing.expect(span.end_ns - span.start_ns >= 50_000_000); // at least 50ms delta
+}
+
+test "OtelObserver vtable through Observer interface" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // Verify it works through the generic Observer interface
+    try std.testing.expectEqualStrings("otel", obs.getName());
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 10 };
+    obs.recordMetric(&metric);
+    obs.flush(); // flush attempt (curl fails silently)
 }

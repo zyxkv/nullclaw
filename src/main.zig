@@ -836,7 +836,7 @@ fn printUsage() void {
         \\
         \\OPTIONS:
         \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
-        \\  agent [-m MESSAGE] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
+        \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  daemon [--port PORT] [--host HOST]
         \\  service <install|start|stop|status|uninstall>

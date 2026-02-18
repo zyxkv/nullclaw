@@ -1,0 +1,47 @@
+services:
+  agent:
+    build: .
+    profiles: [agent]
+    stdin_open: true
+    tty: true
+    restart: "no"
+    entrypoint: ["nullclaw"]
+    command: []
+    volumes:
+      - nullclaw_data:/nullclaw-data
+      - ${NULLCLAW_HOST_WORKSPACE:-./.workspace}:/nullclaw-data/workspace
+    environment:
+      - NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+      - NULLCLAW_PROVIDER=${NULLCLAW_PROVIDER:-}
+      - NULLCLAW_MODEL=${NULLCLAW_MODEL:-}
+      - NULLCLAW_API_KEY=${NULLCLAW_API_KEY:-}
+      - NULLCLAW_TEMPERATURE=${NULLCLAW_TEMPERATURE:-}
+      - NULLCLAW_LOG_LEVEL=${NULLCLAW_LOG_LEVEL:-}
+
+  gateway:
+    build: .
+    profiles: [gateway]
+    restart: unless-stopped
+    ports:
+      - "${NULLCLAW_PORT:-3000}:3000"
+    volumes:
+      - nullclaw_data:/nullclaw-data
+      - ${NULLCLAW_HOST_WORKSPACE:-./.workspace}:/nullclaw-data/workspace
+    environment:
+      - NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+      - NULLCLAW_PROVIDER=${NULLCLAW_PROVIDER:-}
+      - NULLCLAW_MODEL=${NULLCLAW_MODEL:-}
+      - NULLCLAW_API_KEY=${NULLCLAW_API_KEY:-}
+      - NULLCLAW_TEMPERATURE=${NULLCLAW_TEMPERATURE:-}
+      - NULLCLAW_LOG_LEVEL=${NULLCLAW_LOG_LEVEL:-}
+      - NULLCLAW_GATEWAY_PORT=3000
+      - NULLCLAW_GATEWAY_HOST=[::]
+    healthcheck:
+      test: [CMD, /usr/local/bin/nullclaw, health]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  nullclaw_data:

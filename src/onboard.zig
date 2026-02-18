@@ -11,6 +11,7 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const memory_root = @import("memory/root.zig");
+const http_util = @import("http_util.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -79,6 +80,283 @@ pub fn providerEnvVar(provider: []const u8) []const u8 {
         if (std.mem.eql(u8, p.key, canonical)) return p.env_var;
     }
     return "API_KEY";
+}
+
+// ── Live model fetching ─────────────────────────────────────────
+
+pub const ModelsCacheEntry = struct {
+    provider: []const u8,
+    models: []const []const u8,
+    fetched_at: i64,
+};
+
+/// Hardcoded fallback models for each provider (used when API fetch fails).
+pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
+    const canonical = canonicalProviderName(provider);
+    if (std.mem.eql(u8, canonical, "openrouter")) return &openrouter_fallback;
+    if (std.mem.eql(u8, canonical, "openai")) return &openai_fallback;
+    if (std.mem.eql(u8, canonical, "groq")) return &groq_fallback;
+    if (std.mem.eql(u8, canonical, "anthropic")) return &anthropic_fallback;
+    if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
+    if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
+    if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
+    return &anthropic_fallback;
+}
+
+const openrouter_fallback = [_][]const u8{
+    "anthropic/claude-sonnet-4.5",
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-5.2",
+    "google/gemini-2.5-pro",
+    "deepseek/deepseek-chat",
+    "meta-llama/llama-3.3-70b-instruct",
+};
+const openai_fallback = [_][]const u8{
+    "gpt-5.2",
+    "gpt-4.5-preview",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "o3-mini",
+};
+const groq_fallback = [_][]const u8{
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+};
+const anthropic_fallback = [_][]const u8{
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+};
+const gemini_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
+const deepseek_fallback = [_][]const u8{
+    "deepseek-chat",
+    "deepseek-reasoner",
+};
+const ollama_fallback = [_][]const u8{
+    "llama3.2",
+    "mistral",
+    "codellama",
+    "phi3",
+};
+
+/// Fetch model IDs from a provider's API. Returns owned slice of owned strings.
+/// For providers without a list endpoint (anthropic, gemini, etc.), returns hardcoded list.
+pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
+    const canonical = canonicalProviderName(provider);
+
+    // Providers with no models-list API
+    if (std.mem.eql(u8, canonical, "anthropic") or
+        std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "deepseek") or
+        std.mem.eql(u8, canonical, "ollama"))
+    {
+        const fallback = fallbackModelsForProvider(canonical);
+        var result: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (result.items) |item| allocator.free(item);
+            result.deinit(allocator);
+        }
+        for (fallback) |m| {
+            try result.append(allocator, try allocator.dupe(u8, m));
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    // Determine URL and auth header
+    var url: []const u8 = undefined;
+    var needs_auth = false;
+    if (std.mem.eql(u8, canonical, "openrouter")) {
+        url = "https://openrouter.ai/api/v1/models";
+        needs_auth = false; // OpenRouter models endpoint is public
+    } else if (std.mem.eql(u8, canonical, "openai")) {
+        url = "https://api.openai.com/v1/models";
+        needs_auth = true;
+    } else if (std.mem.eql(u8, canonical, "groq")) {
+        url = "https://api.groq.com/openai/v1/models";
+        needs_auth = true;
+    } else {
+        return error.FetchFailed;
+    }
+
+    // Build auth header if needed
+    var headers_buf: [1][]const u8 = undefined;
+    var headers: []const []const u8 = &.{};
+    if (needs_auth) {
+        const key = api_key orelse return error.FetchFailed;
+        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
+        defer allocator.free(auth_hdr);
+        headers_buf[0] = auth_hdr;
+        headers = &headers_buf;
+        // Must call curlGet before auth_hdr is freed
+        return fetchAndParseModels(allocator, url, headers);
+    }
+
+    return fetchAndParseModels(allocator, url, headers);
+}
+
+fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: []const []const u8) ![][]const u8 {
+    const response = http_util.curlGet(allocator, url, headers, "10") catch return error.FetchFailed;
+    defer allocator.free(response);
+
+    if (response.len == 0) return error.FetchFailed;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return error.FetchFailed;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return error.FetchFailed;
+
+    const data = root.object.get("data") orelse return error.FetchFailed;
+    if (data != .array) return error.FetchFailed;
+
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (result.items) |item| allocator.free(item);
+        result.deinit(allocator);
+    }
+
+    for (data.array.items) |item| {
+        if (item != .object) continue;
+        const id_val = item.object.get("id") orelse continue;
+        if (id_val != .string) continue;
+        try result.append(allocator, try allocator.dupe(u8, id_val.string));
+    }
+
+    if (result.items.len == 0) return error.FetchFailed;
+    return result.toOwnedSlice(allocator);
+}
+
+/// Load models with file-based cache. Cache expires after 12 hours.
+/// Falls back to hardcoded list on any error.
+pub fn loadModelsWithCache(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8) []const []const u8 {
+    return loadModelsWithCacheInner(allocator, cache_dir, provider, api_key) catch {
+        return fallbackModelsForProvider(provider);
+    };
+}
+
+fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
+    const canonical = canonicalProviderName(provider);
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/models_cache.json", .{cache_dir});
+    defer allocator.free(cache_path);
+
+    // Try reading cache file
+    if (readCachedModels(allocator, cache_path, canonical)) |cached| {
+        return cached;
+    } else |_| {}
+
+    // Cache miss or expired — fetch from API
+    const models = try fetchModelsFromApi(allocator, canonical, api_key);
+
+    // Best-effort: save to cache (coerce [][]const u8 -> []const []const u8)
+    const models_const: []const []const u8 = models;
+    saveCachedModels(allocator, cache_path, canonical, models_const) catch {};
+
+    return models;
+}
+
+const CACHE_TTL_SECS: i64 = 12 * 3600; // 12 hours
+
+fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8) ![][]const u8 {
+    const file = std.fs.openFileAbsolute(cache_path, .{}) catch return error.CacheNotFound;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 256 * 1024) catch return error.CacheReadError;
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.CacheParseError;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return error.CacheParseError;
+
+    // Check timestamp
+    const ts_val = root.object.get("fetched_at") orelse return error.CacheParseError;
+    const fetched_at: i64 = switch (ts_val) {
+        .integer => ts_val.integer,
+        else => return error.CacheParseError,
+    };
+
+    const now = std.time.timestamp();
+    if (now - fetched_at > CACHE_TTL_SECS) return error.CacheExpired;
+
+    // Get provider's model list
+    const provider_val = root.object.get(provider) orelse return error.CacheProviderMissing;
+    if (provider_val != .array) return error.CacheParseError;
+
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (result.items) |item| allocator.free(item);
+        result.deinit(allocator);
+    }
+
+    for (provider_val.array.items) |item| {
+        if (item != .string) continue;
+        try result.append(allocator, try allocator.dupe(u8, item.string));
+    }
+
+    if (result.items.len == 0) return error.CacheEmpty;
+    return result.toOwnedSlice(allocator);
+}
+
+fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8, models: []const []const u8) !void {
+    // Build simple JSON: { "fetched_at": <ts>, "<provider>": ["model1", ...] }
+    // We merge into existing cache if present
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\n  \"fetched_at\": ");
+    var ts_buf: [24]u8 = undefined;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch return;
+    try buf.appendSlice(allocator, ts_str);
+    try buf.appendSlice(allocator, ",\n  \"");
+    try buf.appendSlice(allocator, provider);
+    try buf.appendSlice(allocator, "\": [");
+
+    for (models, 0..) |m, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, m);
+        try buf.append(allocator, '"');
+    }
+
+    try buf.appendSlice(allocator, "]\n}\n");
+
+    const file = std.fs.createFileAbsolute(cache_path, .{}) catch return;
+    defer file.close();
+    file.writeAll(buf.items) catch {};
+}
+
+/// Parse a mock OpenRouter-style JSON response and extract model IDs.
+/// Used for testing the JSON parsing logic without network access.
+pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![][]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return error.FetchFailed;
+    const data = root.object.get("data") orelse return error.FetchFailed;
+    if (data != .array) return error.FetchFailed;
+
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (result.items) |item| allocator.free(item);
+        result.deinit(allocator);
+    }
+
+    for (data.array.items) |item| {
+        if (item != .object) continue;
+        const id_val = item.object.get("id") orelse continue;
+        if (id_val != .string) continue;
+        try result.append(allocator, try allocator.dupe(u8, id_val.string));
+    }
+
+    return result.toOwnedSlice(allocator);
 }
 
 // ── Quick setup ──────────────────────────────────────────────────
@@ -254,14 +532,55 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
     }
 
-    // ── Step 3: Model ──
-    try out.print("  Step 3/8: Model [default: {s}]: ", .{selected_provider.default_model});
-    const model_input = prompt(out, &input_buf, "", selected_provider.default_model) orelse {
+    // ── Step 3: Model (with live fetching) ──
+    try out.writeAll("  Step 3/8: Select a model\n");
+    try out.writeAll("  Fetching available models...\n");
+    try out.flush();
+
+    // Build cache dir path
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const cache_dir = if (home_dir) |h| blk: {
+        defer allocator.free(h);
+        break :blk std.fmt.allocPrint(allocator, "{s}/.nullclaw", .{h}) catch null;
+    } else null;
+
+    const live_models = if (cache_dir) |cd| blk: {
+        defer allocator.free(cd);
+        break :blk loadModelsWithCache(allocator, cd, selected_provider.key, cfg.api_key);
+    } else fallbackModelsForProvider(selected_provider.key);
+
+    // Show up to 15 models as numbered choices
+    const display_max: usize = @min(live_models.len, 15);
+    for (live_models[0..display_max], 0..) |m, i| {
+        const is_default = std.mem.eql(u8, m, selected_provider.default_model);
+        if (is_default) {
+            try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+        } else {
+            try out.print("    [{d}] {s}\n", .{ i + 1, m });
+        }
+    }
+    if (live_models.len > display_max) {
+        try out.print("    ... and {d} more (type name to use any model)\n", .{live_models.len - display_max});
+    }
+    try out.print("  Choice [1] or model name [{s}]: ", .{selected_provider.default_model});
+    const model_input = prompt(out, &input_buf, "", "") orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
         return;
     };
-    cfg.default_model = if (model_input.len > 0) try allocator.dupe(u8, model_input) else selected_provider.default_model;
+    if (model_input.len == 0) {
+        // Default: use first model from the list (or provider default)
+        cfg.default_model = if (live_models.len > 0) live_models[0] else selected_provider.default_model;
+    } else if (std.fmt.parseInt(usize, model_input, 10)) |num| {
+        if (num >= 1 and num <= display_max) {
+            cfg.default_model = live_models[num - 1];
+        } else {
+            cfg.default_model = selected_provider.default_model;
+        }
+    } else |_| {
+        // Free-form model name typed by user
+        cfg.default_model = try allocator.dupe(u8, model_input);
+    }
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
 
     // ── Step 4: Memory backend ──
@@ -420,7 +739,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 
     // Collect models from each provider using curl
     var total_models: usize = 0;
-    var results_buf: std.ArrayList(u8) = .empty;
+    var results_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer results_buf.deinit(allocator);
 
     try results_buf.appendSlice(allocator, "{\n");
@@ -1169,4 +1488,238 @@ test "scaffoldWorkspace creates all prompt.zig files" {
         };
         file.close();
     }
+}
+
+// ── Live model fetching tests ───────────────────────────────────
+
+test "fallbackModelsForProvider returns models for known providers" {
+    const or_models = fallbackModelsForProvider("openrouter");
+    try std.testing.expect(or_models.len >= 3);
+
+    const oai_models = fallbackModelsForProvider("openai");
+    try std.testing.expect(oai_models.len >= 3);
+
+    const anth_models = fallbackModelsForProvider("anthropic");
+    try std.testing.expect(anth_models.len >= 3);
+    try std.testing.expectEqualStrings("claude-opus-4-6", anth_models[0]);
+
+    const groq_models = fallbackModelsForProvider("groq");
+    try std.testing.expect(groq_models.len >= 2);
+
+    const gemini_models = fallbackModelsForProvider("gemini");
+    try std.testing.expect(gemini_models.len >= 2);
+}
+
+test "fallbackModelsForProvider handles aliases" {
+    const models = fallbackModelsForProvider("google");
+    try std.testing.expect(models.len >= 2);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+}
+
+test "fallbackModelsForProvider unknown returns anthropic fallback" {
+    const models = fallbackModelsForProvider("some-unknown-provider");
+    try std.testing.expect(models.len >= 3);
+    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+}
+
+test "parseModelIds extracts IDs from OpenRouter-style response" {
+    const json =
+        \\{"data": [
+        \\  {"id": "openai/gpt-4", "name": "GPT-4"},
+        \\  {"id": "anthropic/claude-3", "name": "Claude 3"},
+        \\  {"id": "meta/llama-3", "name": "Llama 3"}
+        \\]}
+    ;
+    const models = try parseModelIds(std.testing.allocator, json);
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+
+    try std.testing.expect(models.len == 3);
+    try std.testing.expectEqualStrings("openai/gpt-4", models[0]);
+    try std.testing.expectEqualStrings("anthropic/claude-3", models[1]);
+    try std.testing.expectEqualStrings("meta/llama-3", models[2]);
+}
+
+test "parseModelIds handles empty data array" {
+    const json = "{\"data\": []}";
+    const models = try parseModelIds(std.testing.allocator, json);
+    defer std.testing.allocator.free(models);
+    try std.testing.expect(models.len == 0);
+}
+
+test "parseModelIds rejects invalid JSON" {
+    const result = parseModelIds(std.testing.allocator, "not json");
+    try std.testing.expectError(error.FetchFailed, result);
+}
+
+test "parseModelIds rejects missing data field" {
+    const result = parseModelIds(std.testing.allocator, "{\"models\": []}");
+    try std.testing.expectError(error.FetchFailed, result);
+}
+
+test "parseModelIds skips entries without id" {
+    const json =
+        \\{"data": [
+        \\  {"id": "model-a"},
+        \\  {"name": "no-id"},
+        \\  {"id": "model-b"}
+        \\]}
+    ;
+    const models = try parseModelIds(std.testing.allocator, json);
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+    try std.testing.expect(models.len == 2);
+    try std.testing.expectEqualStrings("model-a", models[0]);
+    try std.testing.expectEqualStrings("model-b", models[1]);
+}
+
+test "cache read returns error for missing file" {
+    const result = readCachedModels(std.testing.allocator, "/tmp/nonexistent-cache-12345.json", "openai");
+    try std.testing.expectError(error.CacheNotFound, result);
+}
+
+test "cache round-trip: write then read fresh cache" {
+    const cache_dir = "/tmp/nullclaw-test-cache-rt";
+    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(cache_dir) catch {};
+
+    const cache_path = "/tmp/nullclaw-test-cache-rt/models_cache.json";
+
+    // Write cache
+    const models = [_][]const u8{
+        "model-alpha",
+        "model-beta",
+        "model-gamma",
+    };
+    try saveCachedModels(std.testing.allocator, cache_path, "testprov", &models);
+
+    // Read back
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "testprov");
+    defer {
+        for (loaded) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expect(loaded.len == 3);
+    try std.testing.expectEqualStrings("model-alpha", loaded[0]);
+    try std.testing.expectEqualStrings("model-beta", loaded[1]);
+    try std.testing.expectEqualStrings("model-gamma", loaded[2]);
+}
+
+test "cache read returns error for wrong provider" {
+    const cache_dir = "/tmp/nullclaw-test-cache-wrongprov";
+    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(cache_dir) catch {};
+
+    const cache_path = "/tmp/nullclaw-test-cache-wrongprov/models_cache.json";
+
+    const models = [_][]const u8{"model-a"};
+    try saveCachedModels(std.testing.allocator, cache_path, "provA", &models);
+
+    // Reading for a different provider should fail
+    const result = readCachedModels(std.testing.allocator, cache_path, "provB");
+    try std.testing.expectError(error.CacheProviderMissing, result);
+}
+
+test "cache read returns error for expired cache" {
+    const cache_dir = "/tmp/nullclaw-test-cache-expired";
+    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(cache_dir) catch {};
+
+    const cache_path = "/tmp/nullclaw-test-cache-expired/models_cache.json";
+
+    // Write a cache with old timestamp
+    const old_json = "{\"fetched_at\": 1000000, \"myprov\": [\"old-model\"]}";
+    const file = try std.fs.createFileAbsolute(cache_path, .{});
+    defer file.close();
+    try file.writeAll(old_json);
+
+    const result = readCachedModels(std.testing.allocator, cache_path, "myprov");
+    try std.testing.expectError(error.CacheExpired, result);
+}
+
+test "loadModelsWithCache falls back on fetch failure" {
+    // openai without api key will fail fetch, falling back to hardcoded list
+    const models = loadModelsWithCache(std.testing.allocator, "/tmp/nonexistent-dir-xyz", "openai", null);
+    // Should return static fallback
+    try std.testing.expect(models.len >= 3);
+    try std.testing.expectEqualStrings("gpt-5.2", models[0]);
+}
+
+test "loadModelsWithCache returns models for anthropic" {
+    const cache_dir = "/tmp/nullclaw-test-cache-anthropic";
+    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(cache_dir) catch {};
+
+    const models = loadModelsWithCache(std.testing.allocator, cache_dir, "anthropic", null);
+    // Anthropic returns hardcoded models (allocated copies)
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+    try std.testing.expect(models.len == 3);
+    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+}
+
+test "fetchModelsFromApi returns hardcoded for anthropic" {
+    const models = try fetchModelsFromApi(std.testing.allocator, "anthropic", null);
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+    try std.testing.expect(models.len == 3);
+    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", models[1]);
+    try std.testing.expectEqualStrings("claude-haiku-4-5", models[2]);
+}
+
+test "fetchModelsFromApi returns hardcoded for ollama" {
+    const models = try fetchModelsFromApi(std.testing.allocator, "ollama", null);
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+    try std.testing.expect(models.len >= 3);
+    try std.testing.expectEqualStrings("llama3.2", models[0]);
+}
+
+test "fetchModelsFromApi returns error for openai without key" {
+    const result = fetchModelsFromApi(std.testing.allocator, "openai", null);
+    try std.testing.expectError(error.FetchFailed, result);
+}
+
+test "fetchModelsFromApi returns error for groq without key" {
+    const result = fetchModelsFromApi(std.testing.allocator, "groq", null);
+    try std.testing.expectError(error.FetchFailed, result);
+}
+
+test "ModelsCacheEntry struct has expected fields" {
+    const entry = ModelsCacheEntry{
+        .provider = "openai",
+        .models = &.{ "gpt-4", "gpt-3.5-turbo" },
+        .fetched_at = 1700000000,
+    };
+    try std.testing.expectEqualStrings("openai", entry.provider);
+    try std.testing.expect(entry.models.len == 2);
+    try std.testing.expect(entry.fetched_at == 1700000000);
+}
+
+test "CACHE_TTL_SECS is 12 hours" {
+    try std.testing.expect(CACHE_TTL_SECS == 43200);
 }

@@ -6,6 +6,7 @@ const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
+const ContentPart = root.ContentPart;
 const ToolCall = root.ToolCall;
 const ToolSpec = root.ToolSpec;
 const TokenUsage = root.TokenUsage;
@@ -350,6 +351,39 @@ pub const AnthropicProvider = struct {
     }
 };
 
+/// Serialize a single message's content field in Anthropic format.
+/// Plain text → JSON string, multimodal → content array with type:text / type:image blocks.
+fn serializeAnthropicContent(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, msg: ChatMessage) !void {
+    if (msg.content_parts) |parts| {
+        try buf.append(allocator, '[');
+        for (parts, 0..) |part, j| {
+            if (j > 0) try buf.append(allocator, ',');
+            switch (part) {
+                .text => |text| {
+                    try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+                    try root.appendJsonString(buf, allocator, text);
+                    try buf.append(allocator, '}');
+                },
+                .image_url => |img| {
+                    try buf.appendSlice(allocator, "{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":");
+                    try root.appendJsonString(buf, allocator, img.url);
+                    try buf.appendSlice(allocator, "}}");
+                },
+                .image_base64 => |img| {
+                    try buf.appendSlice(allocator, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                    try root.appendJsonString(buf, allocator, img.media_type);
+                    try buf.appendSlice(allocator, ",\"data\":");
+                    try root.appendJsonString(buf, allocator, img.data);
+                    try buf.appendSlice(allocator, "}}");
+                },
+            }
+        }
+        try buf.append(allocator, ']');
+    } else {
+        try root.appendJsonString(buf, allocator, msg.content);
+    }
+}
+
 /// Build a full chat request JSON body from a ChatRequest (Anthropic messages format).
 /// System messages are extracted and placed in the top-level "system" field.
 /// User/assistant/tool messages go in the "messages" array.
@@ -398,7 +432,7 @@ fn buildChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, "\",\"content\":");
-        try root.appendJsonString(&buf, allocator, msg.content);
+        try serializeAnthropicContent(&buf, allocator, msg);
         try buf.append(allocator, '}');
     }
 
@@ -456,7 +490,7 @@ fn buildStreamingChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, "\",\"content\":");
-        try root.appendJsonString(&buf, allocator, msg.content);
+        try serializeAnthropicContent(&buf, allocator, msg);
         try buf.append(allocator, '}');
     }
 
@@ -831,4 +865,106 @@ test "vtable stream_chat is not null" {
 
 test "vtable supports_streaming is not null" {
     try std.testing.expect(AnthropicProvider.vtable.supports_streaming != null);
+}
+
+// ── Multimodal Serialization Tests ──────────────────────────────
+
+test "buildChatRequestBody without content_parts serializes plain string" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    const content = messages.items[0].object.get("content").?;
+    try std.testing.expect(content == .string);
+    try std.testing.expectEqualStrings("plain text", content.string);
+}
+
+test "buildChatRequestBody with base64 image serializes Anthropic format" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("What is this?"),
+        root.makeBase64ImagePart("iVBORw0KGgo=", "image/png"),
+    };
+    const msgs = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    }};
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    const content = messages.items[0].object.get("content").?;
+    try std.testing.expect(content == .array);
+    try std.testing.expect(content.array.items.len == 2);
+
+    // First part: text
+    const text_part = content.array.items[0].object;
+    try std.testing.expectEqualStrings("text", text_part.get("type").?.string);
+    try std.testing.expectEqualStrings("What is this?", text_part.get("text").?.string);
+
+    // Second part: image with base64 source
+    const img_part = content.array.items[1].object;
+    try std.testing.expectEqualStrings("image", img_part.get("type").?.string);
+    const source = img_part.get("source").?.object;
+    try std.testing.expectEqualStrings("base64", source.get("type").?.string);
+    try std.testing.expectEqualStrings("image/png", source.get("media_type").?.string);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", source.get("data").?.string);
+}
+
+test "buildChatRequestBody with image URL serializes Anthropic URL source" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeImageUrlPart("https://example.com/photo.jpg"),
+    };
+    const msgs = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    }};
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    const content = messages.items[0].object.get("content").?.array;
+    const img_part = content.items[0].object;
+    try std.testing.expectEqualStrings("image", img_part.get("type").?.string);
+    const source = img_part.get("source").?.object;
+    try std.testing.expectEqualStrings("url", source.get("type").?.string);
+    try std.testing.expectEqualStrings("https://example.com/photo.jpg", source.get("url").?.string);
+}
+
+test "buildStreamingChatRequestBody with content_parts serializes correctly" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("Describe"),
+        root.makeBase64ImagePart("AAAA", "image/jpeg"),
+    };
+    const msgs = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    }};
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildStreamingChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    // Should have stream:true and the image data
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "AAAA") != null);
 }

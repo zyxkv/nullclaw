@@ -12,10 +12,58 @@ pub const compatible = @import("compatible.zig");
 pub const reliable = @import("reliable.zig");
 pub const router = @import("router.zig");
 pub const sse = @import("sse.zig");
+pub const claude_cli = @import("claude_cli.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // Core Types
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Level of detail for image processing.
+pub const ImageDetail = enum {
+    auto,
+    low,
+    high,
+
+    pub fn toSlice(self: ImageDetail) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .low => "low",
+            .high => "high",
+        };
+    }
+};
+
+/// A single content part in a multimodal message.
+pub const ContentPart = union(enum) {
+    text: []const u8,
+    image_url: ImageUrl,
+    image_base64: ImageBase64,
+
+    pub const ImageUrl = struct {
+        url: []const u8,
+        detail: ImageDetail = .auto,
+    };
+
+    pub const ImageBase64 = struct {
+        data: []const u8,
+        media_type: []const u8,
+    };
+};
+
+/// Create a text content part.
+pub fn makeTextPart(text: []const u8) ContentPart {
+    return .{ .text = text };
+}
+
+/// Create an image URL content part.
+pub fn makeImageUrlPart(url: []const u8) ContentPart {
+    return .{ .image_url = .{ .url = url } };
+}
+
+/// Create a base64-encoded image content part.
+pub fn makeBase64ImagePart(data: []const u8, media_type: []const u8) ContentPart {
+    return .{ .image_base64 = .{ .data = data, .media_type = media_type } };
+}
 
 /// Roles a message can have in a conversation.
 pub const Role = enum {
@@ -50,6 +98,9 @@ pub const ChatMessage = struct {
     name: ?[]const u8 = null,
     /// Tool call ID this message responds to.
     tool_call_id: ?[]const u8 = null,
+    /// Optional multimodal content parts (images, etc.). When set, providers
+    /// serialize these instead of the plain `content` field.
+    content_parts: ?[]const ContentPart = null,
 
     pub fn system(content: []const u8) ChatMessage {
         return .{ .role = .system, .content = content };
@@ -594,6 +645,8 @@ pub const ProviderKind = enum {
     ollama_provider,
     gemini_provider,
     compatible_provider,
+    claude_cli_provider,
+    codex_cli_provider,
     unknown,
 };
 
@@ -604,6 +657,8 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
     if (std.mem.eql(u8, name, "openrouter")) return .openrouter_provider;
     if (std.mem.eql(u8, name, "ollama")) return .ollama_provider;
     if (std.mem.eql(u8, name, "gemini") or std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return .gemini_provider;
+    if (std.mem.eql(u8, name, "claude-cli")) return .claude_cli_provider;
+    if (std.mem.eql(u8, name, "codex-cli")) return .codex_cli_provider;
 
     // OpenAI-compatible providers
     const compat_names = [_][]const u8{
@@ -1462,6 +1517,55 @@ test "appendJsonString encodes control chars as \\uXXXX" {
     // BEL character (0x07) should be encoded as \u0007
     try json_util.appendJsonString(&buf, allocator, "\x07");
     try std.testing.expectEqualStrings("\"\\u0007\"", buf.items);
+}
+
+// ── Multimodal Content Part Tests ────────────────────────────────
+
+test "makeTextPart creates text content part" {
+    const part = makeTextPart("Hello world");
+    try std.testing.expect(part == .text);
+    try std.testing.expectEqualStrings("Hello world", part.text);
+}
+
+test "makeImageUrlPart creates image_url content part with auto detail" {
+    const part = makeImageUrlPart("https://example.com/image.png");
+    try std.testing.expect(part == .image_url);
+    try std.testing.expectEqualStrings("https://example.com/image.png", part.image_url.url);
+    try std.testing.expect(part.image_url.detail == .auto);
+}
+
+test "makeBase64ImagePart creates image_base64 content part" {
+    const part = makeBase64ImagePart("iVBORw0KGgo=", "image/png");
+    try std.testing.expect(part == .image_base64);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", part.image_base64.data);
+    try std.testing.expectEqualStrings("image/png", part.image_base64.media_type);
+}
+
+test "ImageDetail.toSlice returns correct strings" {
+    try std.testing.expectEqualStrings("auto", ImageDetail.auto.toSlice());
+    try std.testing.expectEqualStrings("low", ImageDetail.low.toSlice());
+    try std.testing.expectEqualStrings("high", ImageDetail.high.toSlice());
+}
+
+test "ChatMessage content_parts defaults to null" {
+    const msg = ChatMessage.user("hello");
+    try std.testing.expect(msg.content_parts == null);
+}
+
+test "ChatMessage with content_parts set" {
+    const parts = [_]ContentPart{
+        makeTextPart("Describe this image"),
+        makeImageUrlPart("https://example.com/cat.jpg"),
+    };
+    const msg = ChatMessage{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    };
+    try std.testing.expect(msg.content_parts != null);
+    try std.testing.expect(msg.content_parts.?.len == 2);
+    try std.testing.expect(msg.content_parts.?[0] == .text);
+    try std.testing.expect(msg.content_parts.?[1] == .image_url);
 }
 
 test {

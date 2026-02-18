@@ -338,6 +338,178 @@ fn introspectLinux(path: []const u8) IntrospectResult {
     };
 }
 
+// ── USB Hotplug Monitoring ──────────────────────────────────────
+
+/// Action type for hotplug device events.
+pub const DeviceAction = enum {
+    added,
+    removed,
+    changed,
+};
+
+/// A USB hotplug event emitted by the monitor.
+pub const DeviceEvent = struct {
+    action: DeviceAction,
+    device_path: []const u8,
+    subsystem: []const u8,
+    timestamp_ns: u64,
+};
+
+/// Real-time USB hotplug monitor that watches for device connect/disconnect events.
+pub const HotplugMonitor = struct {
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    allocator: std.mem.Allocator,
+    callback: *const fn (event: DeviceEvent) void,
+};
+
+/// Start a hotplug monitor that calls `callback` on USB device events.
+/// On Linux: spawns udevadm monitor and parses its output.
+/// On macOS: stub monitor (sleeps until stopped).
+/// On other platforms: returns a no-op monitor with running=false.
+pub fn startHotplugMonitor(allocator: std.mem.Allocator, callback: *const fn (event: DeviceEvent) void) !HotplugMonitor {
+    var monitor = HotplugMonitor{
+        .allocator = allocator,
+        .callback = callback,
+    };
+    switch (comptime builtin.os.tag) {
+        .linux => {
+            monitor.running = std.atomic.Value(bool).init(true);
+            monitor.thread = try std.Thread.spawn(.{}, runLinuxMonitor, .{&monitor});
+        },
+        .macos => {
+            monitor.running = std.atomic.Value(bool).init(true);
+            monitor.thread = try std.Thread.spawn(.{}, runMacosMonitor, .{&monitor});
+        },
+        else => {},
+    }
+    return monitor;
+}
+
+/// Stop the hotplug monitor and wait for the thread to finish.
+pub fn stopHotplugMonitor(monitor: *HotplugMonitor) void {
+    monitor.running.store(false, .release);
+    if (monitor.thread) |t| {
+        t.join();
+        monitor.thread = null;
+    }
+}
+
+/// Parse a udevadm monitor output line.
+/// Expected format: "UDEV  [1234.567890] add      /devices/pci0000:00/... (usb)"
+/// Returns null if the line cannot be parsed.
+pub fn parseUdevLine(line: []const u8) ?DeviceEvent {
+    // Must start with "UDEV" (skip KERNEL events)
+    if (!std.mem.startsWith(u8, line, "UDEV")) return null;
+
+    // Find timestamp in brackets: [timestamp]
+    const ts_start = std.mem.indexOf(u8, line, "[") orelse return null;
+    const ts_end = std.mem.indexOf(u8, line, "]") orelse return null;
+    if (ts_end <= ts_start + 1) return null;
+
+    // Parse the action keyword after the ']'
+    var rest = line[ts_end + 1 ..];
+    // Skip whitespace
+    while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+
+    const action = parseAction(rest) orelse return null;
+    const action_len = actionLen(rest);
+    rest = rest[action_len..];
+    while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+
+    // Device path is everything up to the parenthesized subsystem
+    var device_path: []const u8 = rest;
+    var subsystem: []const u8 = "unknown";
+
+    if (std.mem.lastIndexOf(u8, rest, "(")) |paren_start| {
+        device_path = std.mem.trimRight(u8, rest[0..paren_start], " ");
+        const after_paren = rest[paren_start + 1 ..];
+        if (std.mem.indexOf(u8, after_paren, ")")) |paren_end| {
+            subsystem = after_paren[0..paren_end];
+        }
+    }
+
+    // Parse timestamp as nanoseconds (float seconds * 1e9)
+    const ts_str = line[ts_start + 1 .. ts_end];
+    const timestamp_ns = parseTimestampNs(ts_str);
+
+    return DeviceEvent{
+        .action = action,
+        .device_path = device_path,
+        .subsystem = subsystem,
+        .timestamp_ns = timestamp_ns,
+    };
+}
+
+fn parseAction(rest: []const u8) ?DeviceAction {
+    if (std.mem.startsWith(u8, rest, "add")) return .added;
+    if (std.mem.startsWith(u8, rest, "remove")) return .removed;
+    if (std.mem.startsWith(u8, rest, "change")) return .changed;
+    return null;
+}
+
+fn actionLen(rest: []const u8) usize {
+    if (std.mem.startsWith(u8, rest, "remove")) return 6;
+    if (std.mem.startsWith(u8, rest, "change")) return 6;
+    if (std.mem.startsWith(u8, rest, "add")) return 3;
+    return 0;
+}
+
+fn parseTimestampNs(ts_str: []const u8) u64 {
+    const trimmed = std.mem.trim(u8, ts_str, " ");
+    // Format: "1234.567890" — seconds with fractional part
+    if (std.mem.indexOf(u8, trimmed, ".")) |dot_pos| {
+        const secs = std.fmt.parseInt(u64, trimmed[0..dot_pos], 10) catch 0;
+        const frac_str = trimmed[dot_pos + 1 ..];
+        var frac: u64 = std.fmt.parseInt(u64, frac_str, 10) catch 0;
+        // Normalize fractional part to nanoseconds (9 digits)
+        var digits: usize = frac_str.len;
+        while (digits < 9) : (digits += 1) frac *= 10;
+        while (digits > 9) : (digits -= 1) frac /= 10;
+        return secs * 1_000_000_000 + frac;
+    } else {
+        const secs = std.fmt.parseInt(u64, trimmed, 10) catch 0;
+        return secs * 1_000_000_000;
+    }
+}
+
+/// Linux monitor: spawn udevadm and parse its stdout.
+fn runLinuxMonitor(monitor: *HotplugMonitor) void {
+    var child = std.process.Child.init(
+        &.{ "udevadm", "monitor", "--udev", "--subsystem-match=usb", "--subsystem-match=tty" },
+        monitor.allocator,
+    );
+    child.stdout_behavior = .pipe;
+    child.stderr_behavior = .pipe;
+    child.spawn() catch return;
+    defer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    const stdout = child.stdout orelse return;
+    var buf: [4096]u8 = undefined;
+    while (monitor.running.load(.acquire)) {
+        const n = stdout.read(&buf) catch break;
+        if (n == 0) break;
+        var lines_iter = std.mem.splitScalar(u8, buf[0..n], '\n');
+        while (lines_iter.next()) |line| {
+            if (line.len == 0) continue;
+            if (parseUdevLine(line)) |event| {
+                monitor.callback(event);
+            }
+        }
+    }
+}
+
+/// macOS monitor: stub that sleeps until stopped.
+/// A full implementation would use IOKit notifications.
+fn runMacosMonitor(monitor: *HotplugMonitor) void {
+    while (monitor.running.load(.acquire)) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 test "lookupBoard finds nucleo-f401re" {
@@ -523,4 +695,124 @@ test "parseHexFromLine with trailing parenthetical" {
 test "freeDiscoveredDevices with empty slice" {
     // Should not crash when called with an empty comptime slice.
     freeDiscoveredDevices(std.testing.allocator, &.{});
+}
+
+// ── Hotplug Monitor Tests ──────────────────────────────────────
+
+test "DeviceEvent struct creation" {
+    const event = DeviceEvent{
+        .action = .added,
+        .device_path = "/dev/ttyUSB0",
+        .subsystem = "usb",
+        .timestamp_ns = 1234567890,
+    };
+    try std.testing.expectEqual(DeviceAction.added, event.action);
+    try std.testing.expectEqualStrings("/dev/ttyUSB0", event.device_path);
+    try std.testing.expectEqualStrings("usb", event.subsystem);
+    try std.testing.expectEqual(@as(u64, 1234567890), event.timestamp_ns);
+}
+
+test "DeviceEvent all actions" {
+    const added = DeviceEvent{ .action = .added, .device_path = "/dev/a", .subsystem = "usb", .timestamp_ns = 0 };
+    const removed = DeviceEvent{ .action = .removed, .device_path = "/dev/b", .subsystem = "tty", .timestamp_ns = 1 };
+    const changed = DeviceEvent{ .action = .changed, .device_path = "/dev/c", .subsystem = "usb", .timestamp_ns = 2 };
+    try std.testing.expectEqual(DeviceAction.added, added.action);
+    try std.testing.expectEqual(DeviceAction.removed, removed.action);
+    try std.testing.expectEqual(DeviceAction.changed, changed.action);
+}
+
+test "parseUdevLine parses add event" {
+    const line = "UDEV  [1234.567890] add      /devices/pci0000:00/0000:00:14.0/usb1/1-1 (usb)";
+    const event = parseUdevLine(line);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(DeviceAction.added, event.?.action);
+    try std.testing.expectEqualStrings("/devices/pci0000:00/0000:00:14.0/usb1/1-1", event.?.device_path);
+    try std.testing.expectEqualStrings("usb", event.?.subsystem);
+    try std.testing.expect(event.?.timestamp_ns > 0);
+}
+
+test "parseUdevLine parses remove event" {
+    const line = "UDEV  [5678.123456] remove   /devices/pci0000:00/0000:00:14.0/usb1/1-1 (usb)";
+    const event = parseUdevLine(line);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(DeviceAction.removed, event.?.action);
+}
+
+test "parseUdevLine parses change event" {
+    const line = "UDEV  [9999.000000] change   /devices/pci0000:00/usb2/2-1 (tty)";
+    const event = parseUdevLine(line);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(DeviceAction.changed, event.?.action);
+    try std.testing.expectEqualStrings("tty", event.?.subsystem);
+}
+
+test "parseUdevLine rejects KERNEL line" {
+    const line = "KERNEL[1234.567890] add      /devices/pci0000:00/usb1/1-1 (usb)";
+    try std.testing.expect(parseUdevLine(line) == null);
+}
+
+test "parseUdevLine rejects empty line" {
+    try std.testing.expect(parseUdevLine("") == null);
+}
+
+test "parseUdevLine rejects malformed line" {
+    try std.testing.expect(parseUdevLine("UDEV  no brackets here") == null);
+}
+
+test "parseUdevLine rejects unknown action" {
+    const line = "UDEV  [1234.567890] bind     /devices/pci0000:00/usb1/1-1 (usb)";
+    try std.testing.expect(parseUdevLine(line) == null);
+}
+
+test "parseUdevLine timestamp parsing" {
+    const line = "UDEV  [100.500000000] add      /devices/test (usb)";
+    const event = parseUdevLine(line);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(@as(u64, 100_500_000_000), event.?.timestamp_ns);
+}
+
+test "parseUdevLine timestamp integer only" {
+    const line = "UDEV  [42] add      /devices/test (usb)";
+    const event = parseUdevLine(line);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(@as(u64, 42_000_000_000), event.?.timestamp_ns);
+}
+
+test "parseUdevLine tty subsystem" {
+    const line = "UDEV  [1000.000] add      /devices/pci0000:00/ttyUSB0 (tty)";
+    const event = parseUdevLine(line);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqualStrings("tty", event.?.subsystem);
+}
+
+test "HotplugMonitor initial state" {
+    var received = false;
+    _ = &received;
+    const monitor = HotplugMonitor{
+        .allocator = std.testing.allocator,
+        .callback = &struct {
+            fn cb(_: DeviceEvent) void {}
+        }.cb,
+    };
+    try std.testing.expect(monitor.thread == null);
+    try std.testing.expect(!monitor.running.raw);
+}
+
+test "startHotplugMonitor returns without error" {
+    var monitor = try startHotplugMonitor(std.testing.allocator, &struct {
+        fn cb(_: DeviceEvent) void {}
+    }.cb);
+    // On macOS: stub thread runs; on Linux: udevadm may fail but monitor still valid
+    // On other platforms: no-op
+    stopHotplugMonitor(&monitor);
+    try std.testing.expect(monitor.thread == null);
+}
+
+test "stopHotplugMonitor is safe to call twice" {
+    var monitor = try startHotplugMonitor(std.testing.allocator, &struct {
+        fn cb(_: DeviceEvent) void {}
+    }.cb);
+    stopHotplugMonitor(&monitor);
+    stopHotplugMonitor(&monitor); // second call should be safe
+    try std.testing.expect(monitor.thread == null);
 }

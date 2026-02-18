@@ -94,8 +94,10 @@ fn buildToolsSection(w: anytype, tools: []const Tool) !void {
     try w.writeAll("\n");
 }
 
-/// Append available skills as an XML block.
-/// Scans workspace_dir/skills/ for installed skills. If none found, appends nothing.
+/// Append available skills with progressive loading.
+/// - always=true skills: full instruction text in the prompt
+/// - always=false skills: XML summary only (agent must use read_file to load)
+/// - unavailable skills: marked with available="false" and missing deps
 fn appendSkillsSection(
     allocator: std.mem.Allocator,
     w: anytype,
@@ -106,15 +108,52 @@ fn appendSkillsSection(
 
     if (skill_list.len == 0) return;
 
-    try w.writeAll("## Available Skills\n\n<available_skills>\n");
+    // Render always=true skills with full instructions first
+    var has_always = false;
     for (skill_list) |skill| {
-        try std.fmt.format(
-            w,
-            "  <skill>\n    <name>{s}</name>\n    <description>{s}</description>\n    <location>{s}/skills/{s}/SKILL.md</location>\n  </skill>\n",
-            .{ skill.name, skill.description, workspace_dir, skill.name },
-        );
+        if (!skill.always or !skill.available) continue;
+        if (!has_always) {
+            try w.writeAll("## Skills\n\n");
+            has_always = true;
+        }
+        try std.fmt.format(w, "### Skill: {s}\n\n", .{skill.name});
+        if (skill.description.len > 0) {
+            try std.fmt.format(w, "{s}\n\n", .{skill.description});
+        }
+        if (skill.instructions.len > 0) {
+            try w.writeAll(skill.instructions);
+            try w.writeAll("\n\n");
+        }
     }
-    try w.writeAll("</available_skills>\n\n");
+
+    // Render summary skills and unavailable skills as XML
+    var has_summary = false;
+    for (skill_list) |skill| {
+        if (skill.always and skill.available) continue; // already rendered above
+        if (!has_summary) {
+            try w.writeAll("## Available Skills\n\n");
+            try w.writeAll("Use the read_file tool to load full skill instructions when needed.\n\n");
+            try w.writeAll("<available_skills>\n");
+            has_summary = true;
+        }
+        if (!skill.available) {
+            try std.fmt.format(
+                w,
+                "  <skill name=\"{s}\" description=\"{s}\" available=\"false\" missing=\"{s}\"/>\n",
+                .{ skill.name, skill.description, skill.missing_deps },
+            );
+        } else {
+            const skill_path = if (skill.path.len > 0) skill.path else workspace_dir;
+            try std.fmt.format(
+                w,
+                "  <skill name=\"{s}\" description=\"{s}\" path=\"{s}/SKILL.md\"/>\n",
+                .{ skill.name, skill.description, skill_path },
+            );
+        }
+    }
+    if (has_summary) {
+        try w.writeAll("</available_skills>\n\n");
+    }
 }
 
 /// Append a human-readable UTC date/time section derived from the system clock.
@@ -231,7 +270,7 @@ test "appendSkillsSection with no skills produces nothing" {
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
-test "appendSkillsSection renders skills XML" {
+test "appendSkillsSection renders summary XML for always=false skill" {
     const allocator = std.testing.allocator;
     const base = "/tmp/nullclaw-prompt-test-skills";
     const skills_dir = "/tmp/nullclaw-prompt-test-skills/skills";
@@ -252,6 +291,7 @@ test "appendSkillsSection renders skills XML" {
     };
     defer std.fs.deleteTreeAbsolute(base) catch {};
 
+    // always defaults to false — should render as summary XML
     {
         const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-skills/skills/greeter/skill.json", .{});
         defer f.close();
@@ -264,11 +304,61 @@ test "appendSkillsSection renders skills XML" {
     try appendSkillsSection(allocator, w, base);
 
     const output = buf.items;
+    // Summary skills should appear as self-closing XML tags
     try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "</available_skills>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "<name>greeter</name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "<description>Greets the user</description>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "SKILL.md</location>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "name=\"greeter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "description=\"Greets the user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "SKILL.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "read_file") != null);
+    // Full instructions should NOT be in the output
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") == null);
+}
+
+test "appendSkillsSection renders full instructions for always=true skill" {
+    const allocator = std.testing.allocator;
+    const base = "/tmp/nullclaw-prompt-test-always";
+    const skills_dir = "/tmp/nullclaw-prompt-test-always/skills";
+    const skill_dir = "/tmp/nullclaw-prompt-test-always/skills/commit";
+
+    std.fs.makeDirAbsolute(base) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skills_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skill_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(base) catch {};
+
+    // always=true skill with instructions
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-always/skills/commit/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"commit\", \"description\": \"Git commit helper\", \"always\": true}");
+    }
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-always/skills/commit/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Always stage before committing.");
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, base);
+
+    const output = buf.items;
+    // Full instructions should be in the output
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "### Skill: commit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Always stage before committing.") != null);
+    // Should NOT appear in summary XML
+    try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") == null);
 }
 
 test "buildSystemPrompt datetime appears before runtime" {

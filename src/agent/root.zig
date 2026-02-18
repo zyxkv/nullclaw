@@ -24,6 +24,7 @@ const ObserverEvent = observability.ObserverEvent;
 pub const dispatcher = @import("dispatcher.zig");
 pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
+const cli_mod = @import("../channels/cli.zig");
 
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
@@ -865,6 +866,23 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
 
+    // Parse agent-specific flags
+    var message_arg: ?[]const u8 = null;
+    var session_id: ?[]const u8 = null;
+    {
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg: []const u8 = args[i];
+            if ((std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) and i + 1 < args.len) {
+                i += 1;
+                message_arg = args[i];
+            } else if ((std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) and i + 1 < args.len) {
+                i += 1;
+                session_id = args[i];
+            }
+        }
+    }
+
     // Create a noop observer
     var noop = observability.NoopObserver{};
     const obs = noop.observer();
@@ -912,6 +930,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         gemini: providers.gemini.GeminiProvider,
         ollama: providers.ollama.OllamaProvider,
         compatible: providers.compatible.OpenAiCompatibleProvider,
+        claude_cli: providers.claude_cli.ClaudeCliProvider,
+        codex_cli: providers.claude_cli.CodexCliProvider,
     };
 
     const kind = providers.classifyProvider(cfg.default_provider);
@@ -938,6 +958,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             cfg.api_key,
             .bearer,
         ) },
+        .claude_cli_provider => if (providers.claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
+            .{ .claude_cli = p }
+        else |_|
+            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
+        .codex_cli_provider => if (providers.claude_cli.CodexCliProvider.init(allocator, null)) |p|
+            .{ .codex_cli = p }
+        else |_|
+            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
         .unknown => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
     };
 
@@ -948,14 +976,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .gemini => |*p| p.provider(),
         .ollama => |*p| p.provider(),
         .compatible => |*p| p.provider(),
+        .claude_cli => |*p| p.provider(),
+        .codex_cli => |*p| p.provider(),
     };
 
     const supports_streaming = provider_i.supportsStreaming();
 
     // Single message mode: nullclaw agent -m "hello"
-    if (args.len >= 2 and (std.mem.eql(u8, args[0], "-m") or std.mem.eql(u8, args[0], "--message"))) {
-        const message = args[1];
+    if (message_arg) |message| {
         try w.print("Sending to {s}...\n", .{cfg.default_provider});
+        if (session_id) |sid| {
+            try w.print("Session: {s}\n", .{sid});
+        }
         try w.flush();
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
@@ -986,11 +1018,41 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         cfg.default_provider,
         cfg.default_model orelse "(default)",
     });
+    if (session_id) |sid| {
+        try w.print("Session: {s}\n", .{sid});
+    }
     if (supports_streaming) {
         try w.print("Streaming: enabled\n", .{});
     }
-    try w.print("Type your message (Ctrl+D to exit):\n\n", .{});
+    try w.print("Type your message (Ctrl+D or 'exit' to quit):\n\n", .{});
     try w.flush();
+
+    // Load command history
+    const history_path = cli_mod.defaultHistoryPath(allocator) catch null;
+    defer if (history_path) |hp| allocator.free(hp);
+
+    var repl_history: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        // Save history on exit
+        if (history_path) |hp| {
+            cli_mod.saveHistory(repl_history.items, hp) catch {};
+        }
+        for (repl_history.items) |entry| allocator.free(entry);
+        repl_history.deinit(allocator);
+    }
+
+    // Seed history from file
+    if (history_path) |hp| {
+        const loaded = cli_mod.loadHistory(allocator, hp) catch null;
+        if (loaded) |entries| {
+            defer allocator.free(entries);
+            for (entries) |entry| {
+                repl_history.append(allocator, entry) catch {
+                    allocator.free(entry);
+                };
+            }
+        }
+    }
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     defer agent.deinit();
@@ -1013,15 +1075,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         var pos: usize = 0;
         while (pos < line_buf.len) {
             const n = stdin.read(line_buf[pos .. pos + 1]) catch return;
-            if (n == 0) return; // EOF
+            if (n == 0) return; // EOF (Ctrl+D)
             if (line_buf[pos] == '\n') break;
             pos += 1;
         }
         const line = line_buf[0..pos];
 
         if (line.len == 0) continue;
-        if (std.mem.eql(u8, line, "exit") or std.mem.eql(u8, line, "quit") or
-            std.mem.eql(u8, line, ":q") or std.mem.eql(u8, line, "/exit")) return;
+        if (cli_mod.CliChannel.isQuitCommand(line)) return;
+
+        // Append to history
+        repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
 
         const response = agent.turn(line) catch |err| {
             try w.print("Error: {}\n", .{err});

@@ -94,6 +94,8 @@ pub const imessage = @import("imessage.zig");
 pub const email = @import("email.zig");
 pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
+pub const line = @import("line.zig");
+pub const onebot = @import("onebot.zig");
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -134,6 +136,68 @@ pub const SplitIterator = struct {
         return chunk;
     }
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Per-Channel Permission Policies
+// ════════════════════════════════════════════════════════════════════════════
+
+/// DM (direct message) permission policy.
+pub const DmPolicy = enum {
+    /// Allow all DMs.
+    allow,
+    /// Deny all DMs.
+    deny,
+    /// Only allow DMs from senders in the allowlist.
+    allowlist,
+};
+
+/// Group/channel message permission policy.
+pub const GroupPolicy = enum {
+    /// Allow all group messages.
+    open,
+    /// Only respond when explicitly mentioned.
+    mention_only,
+    /// Only allow messages from senders in the allowlist.
+    allowlist,
+};
+
+/// Per-channel permission policy configuration.
+pub const ChannelPolicy = struct {
+    dm: DmPolicy = .allow,
+    group: GroupPolicy = .open,
+    allowlist: []const []const u8 = &.{},
+};
+
+/// Check if a message is permitted under the given policy.
+///
+/// - `policy`: the channel permission policy to evaluate
+/// - `sender_id`: the sender of the message
+/// - `is_dm`: true if this is a direct message, false if group
+/// - `is_mention`: true if the bot was mentioned (relevant for group mention_only)
+pub fn checkPolicy(policy: ChannelPolicy, sender_id: []const u8, is_dm: bool, is_mention: bool) bool {
+    if (is_dm) {
+        return switch (policy.dm) {
+            .allow => true,
+            .deny => false,
+            .allowlist => inAllowlist(policy.allowlist, sender_id),
+        };
+    } else {
+        return switch (policy.group) {
+            .open => true,
+            .mention_only => is_mention,
+            .allowlist => inAllowlist(policy.allowlist, sender_id),
+        };
+    }
+}
+
+/// Check if sender_id is in the given allowlist (case-insensitive, supports "*" wildcard).
+fn inAllowlist(allowlist: []const []const u8, sender_id: []const u8) bool {
+    for (allowlist) |entry| {
+        if (std.mem.eql(u8, entry, "*")) return true;
+        if (std.ascii.eqlIgnoreCase(entry, sender_id)) return true;
+    }
+    return false;
+}
 
 /// Check if a user/sender is in an allowlist.
 /// Supports "*" wildcard for allow-all.
@@ -434,6 +498,138 @@ test "splitMessage emoji preserved" {
     var it = splitMessage(msg, 10);
     try std.testing.expectEqualStrings(msg, it.next().?);
     try std.testing.expect(it.next() == null);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Per-Channel Permission Policy Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "checkPolicy dm allow permits all" {
+    const policy = ChannelPolicy{ .dm = .allow };
+    try std.testing.expect(checkPolicy(policy, "alice", true, false));
+    try std.testing.expect(checkPolicy(policy, "bob", true, false));
+    try std.testing.expect(checkPolicy(policy, "", true, false));
+}
+
+test "checkPolicy dm deny blocks all" {
+    const policy = ChannelPolicy{ .dm = .deny };
+    try std.testing.expect(!checkPolicy(policy, "alice", true, false));
+    try std.testing.expect(!checkPolicy(policy, "bob", true, false));
+    try std.testing.expect(!checkPolicy(policy, "", true, false));
+}
+
+test "checkPolicy dm allowlist permits listed senders" {
+    const list = [_][]const u8{ "alice", "bob" };
+    const policy = ChannelPolicy{ .dm = .allowlist, .allowlist = &list };
+    try std.testing.expect(checkPolicy(policy, "alice", true, false));
+    try std.testing.expect(checkPolicy(policy, "bob", true, false));
+    try std.testing.expect(!checkPolicy(policy, "eve", true, false));
+    try std.testing.expect(!checkPolicy(policy, "", true, false));
+}
+
+test "checkPolicy dm allowlist case insensitive" {
+    const list = [_][]const u8{"Alice"};
+    const policy = ChannelPolicy{ .dm = .allowlist, .allowlist = &list };
+    try std.testing.expect(checkPolicy(policy, "alice", true, false));
+    try std.testing.expect(checkPolicy(policy, "ALICE", true, false));
+    try std.testing.expect(checkPolicy(policy, "Alice", true, false));
+    try std.testing.expect(!checkPolicy(policy, "bob", true, false));
+}
+
+test "checkPolicy dm allowlist wildcard" {
+    const list = [_][]const u8{"*"};
+    const policy = ChannelPolicy{ .dm = .allowlist, .allowlist = &list };
+    try std.testing.expect(checkPolicy(policy, "anyone", true, false));
+    try std.testing.expect(checkPolicy(policy, "", true, false));
+}
+
+test "checkPolicy dm allowlist empty denies all" {
+    const policy = ChannelPolicy{ .dm = .allowlist, .allowlist = &.{} };
+    try std.testing.expect(!checkPolicy(policy, "alice", true, false));
+}
+
+test "checkPolicy group open permits all" {
+    const policy = ChannelPolicy{ .group = .open };
+    try std.testing.expect(checkPolicy(policy, "alice", false, false));
+    try std.testing.expect(checkPolicy(policy, "bob", false, true));
+    try std.testing.expect(checkPolicy(policy, "", false, false));
+}
+
+test "checkPolicy group mention_only requires mention" {
+    const policy = ChannelPolicy{ .group = .mention_only };
+    try std.testing.expect(!checkPolicy(policy, "alice", false, false));
+    try std.testing.expect(checkPolicy(policy, "alice", false, true));
+    try std.testing.expect(!checkPolicy(policy, "bob", false, false));
+    try std.testing.expect(checkPolicy(policy, "bob", false, true));
+}
+
+test "checkPolicy group allowlist permits listed senders" {
+    const list = [_][]const u8{ "alice", "bob" };
+    const policy = ChannelPolicy{ .group = .allowlist, .allowlist = &list };
+    try std.testing.expect(checkPolicy(policy, "alice", false, false));
+    try std.testing.expect(checkPolicy(policy, "bob", false, true));
+    try std.testing.expect(!checkPolicy(policy, "eve", false, false));
+    try std.testing.expect(!checkPolicy(policy, "eve", false, true));
+}
+
+test "checkPolicy group allowlist ignores mention flag" {
+    const list = [_][]const u8{"alice"};
+    const policy = ChannelPolicy{ .group = .allowlist, .allowlist = &list };
+    // allowlist permits regardless of mention status
+    try std.testing.expect(checkPolicy(policy, "alice", false, false));
+    try std.testing.expect(checkPolicy(policy, "alice", false, true));
+    // non-listed sender denied regardless of mention
+    try std.testing.expect(!checkPolicy(policy, "eve", false, false));
+    try std.testing.expect(!checkPolicy(policy, "eve", false, true));
+}
+
+test "checkPolicy group allowlist empty denies all" {
+    const policy = ChannelPolicy{ .group = .allowlist, .allowlist = &.{} };
+    try std.testing.expect(!checkPolicy(policy, "alice", false, false));
+    try std.testing.expect(!checkPolicy(policy, "alice", false, true));
+}
+
+test "checkPolicy mixed dm and group on same policy" {
+    const list = [_][]const u8{"alice"};
+    const policy = ChannelPolicy{
+        .dm = .allowlist,
+        .group = .mention_only,
+        .allowlist = &list,
+    };
+    // DM: only alice allowed
+    try std.testing.expect(checkPolicy(policy, "alice", true, false));
+    try std.testing.expect(!checkPolicy(policy, "bob", true, false));
+    // Group: mention_only (allowlist not used for group in mention_only mode)
+    try std.testing.expect(!checkPolicy(policy, "alice", false, false));
+    try std.testing.expect(checkPolicy(policy, "alice", false, true));
+    try std.testing.expect(checkPolicy(policy, "bob", false, true));
+}
+
+test "checkPolicy default policy allows everything" {
+    const policy = ChannelPolicy{};
+    // Default: dm=allow, group=open
+    try std.testing.expect(checkPolicy(policy, "anyone", true, false));
+    try std.testing.expect(checkPolicy(policy, "anyone", false, false));
+    try std.testing.expect(checkPolicy(policy, "anyone", false, true));
+}
+
+test "ChannelPolicy struct defaults" {
+    const policy = ChannelPolicy{};
+    try std.testing.expect(policy.dm == .allow);
+    try std.testing.expect(policy.group == .open);
+    try std.testing.expectEqual(@as(usize, 0), policy.allowlist.len);
+}
+
+test "DmPolicy enum values" {
+    try std.testing.expect(@intFromEnum(DmPolicy.allow) != @intFromEnum(DmPolicy.deny));
+    try std.testing.expect(@intFromEnum(DmPolicy.deny) != @intFromEnum(DmPolicy.allowlist));
+    try std.testing.expect(@intFromEnum(DmPolicy.allow) != @intFromEnum(DmPolicy.allowlist));
+}
+
+test "GroupPolicy enum values" {
+    try std.testing.expect(@intFromEnum(GroupPolicy.open) != @intFromEnum(GroupPolicy.mention_only));
+    try std.testing.expect(@intFromEnum(GroupPolicy.mention_only) != @intFromEnum(GroupPolicy.allowlist));
+    try std.testing.expect(@intFromEnum(GroupPolicy.open) != @intFromEnum(GroupPolicy.allowlist));
 }
 
 test {

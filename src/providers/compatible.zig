@@ -6,6 +6,7 @@ const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
+const ContentPart = root.ContentPart;
 const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
@@ -510,6 +511,42 @@ pub const OpenAiCompatibleProvider = struct {
     fn deinitImpl(_: *anyopaque) void {}
 };
 
+/// Serialize a single message's content field (plain string or multimodal content parts array).
+/// OpenAI format: text → {"type":"text","text":"..."}, image_url → {"type":"image_url","image_url":{"url":"...","detail":"..."}}.
+fn serializeMessageContent(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, msg: ChatMessage) !void {
+    if (msg.content_parts) |parts| {
+        try buf.append(allocator, '[');
+        for (parts, 0..) |part, j| {
+            if (j > 0) try buf.append(allocator, ',');
+            switch (part) {
+                .text => |text| {
+                    try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+                    try root.appendJsonString(buf, allocator, text);
+                    try buf.append(allocator, '}');
+                },
+                .image_url => |img| {
+                    try buf.appendSlice(allocator, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
+                    try root.appendJsonString(buf, allocator, img.url);
+                    try buf.appendSlice(allocator, ",\"detail\":\"");
+                    try buf.appendSlice(allocator, img.detail.toSlice());
+                    try buf.appendSlice(allocator, "\"}}");
+                },
+                .image_base64 => |img| {
+                    // OpenAI accepts base64 images as data URIs in image_url
+                    try buf.appendSlice(allocator, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                    try buf.appendSlice(allocator, img.media_type);
+                    try buf.appendSlice(allocator, ";base64,");
+                    try buf.appendSlice(allocator, img.data);
+                    try buf.appendSlice(allocator, "\"}}");
+                },
+            }
+        }
+        try buf.append(allocator, ']');
+    } else {
+        try root.appendJsonString(buf, allocator, msg.content);
+    }
+}
+
 /// Build a full chat request JSON body from a ChatRequest (OpenAI-compatible format).
 fn buildChatRequestBody(
     allocator: std.mem.Allocator,
@@ -529,7 +566,7 @@ fn buildChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, msg.role.toSlice());
         try buf.appendSlice(allocator, "\",\"content\":");
-        try root.appendJsonString(&buf, allocator, msg.content);
+        try serializeMessageContent(&buf, allocator, msg);
         if (msg.tool_call_id) |tc_id| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(&buf, allocator, tc_id);
@@ -565,7 +602,7 @@ fn buildStreamingChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, msg.role.toSlice());
         try buf.appendSlice(allocator, "\",\"content\":");
-        try root.appendJsonString(&buf, allocator, msg.content);
+        try serializeMessageContent(&buf, allocator, msg);
         if (msg.tool_call_id) |tc_id| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(&buf, allocator, tc_id);
@@ -948,4 +985,109 @@ test "streaming body has model field" {
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "custom-model") != null);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Multimodal serialization tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "buildChatRequestBody without content_parts serializes plain string" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
+
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    defer allocator.free(body);
+
+    // Verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    // Content should be a plain string, not an array
+    const messages = parsed.value.object.get("messages").?.array;
+    const content = messages.items[0].object.get("content").?;
+    try std.testing.expect(content == .string);
+    try std.testing.expectEqualStrings("plain text", content.string);
+}
+
+test "buildChatRequestBody with image_url content_parts serializes OpenAI array" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("What is in this image?"),
+        root.makeImageUrlPart("https://example.com/cat.jpg"),
+    };
+    const msgs = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    }};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
+
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    defer allocator.free(body);
+
+    // Verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    // Content should be an array
+    const messages = parsed.value.object.get("messages").?.array;
+    const content = messages.items[0].object.get("content").?;
+    try std.testing.expect(content == .array);
+    try std.testing.expect(content.array.items.len == 2);
+
+    // First part: text
+    const text_part = content.array.items[0].object;
+    try std.testing.expectEqualStrings("text", text_part.get("type").?.string);
+    try std.testing.expectEqualStrings("What is in this image?", text_part.get("text").?.string);
+
+    // Second part: image_url
+    const img_part = content.array.items[1].object;
+    try std.testing.expectEqualStrings("image_url", img_part.get("type").?.string);
+    const img_url_obj = img_part.get("image_url").?.object;
+    try std.testing.expectEqualStrings("https://example.com/cat.jpg", img_url_obj.get("url").?.string);
+    try std.testing.expectEqualStrings("auto", img_url_obj.get("detail").?.string);
+}
+
+test "buildChatRequestBody with base64 image serializes as data URI" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeBase64ImagePart("AQID", "image/jpeg"),
+    };
+    const msgs = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    }};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
+
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    defer allocator.free(body);
+
+    // Should contain the data URI
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/jpeg;base64,AQID") != null);
+}
+
+test "buildChatRequestBody with high detail image_url" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        .{ .image_url = .{ .url = "https://example.com/photo.png", .detail = .high } },
+    };
+    const msgs = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    }};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
+
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    const content = messages.items[0].object.get("content").?.array;
+    const img_url_obj = content.items[0].object.get("image_url").?.object;
+    try std.testing.expectEqualStrings("high", img_url_obj.get("detail").?.string);
 }

@@ -39,6 +39,7 @@ pub const CliChannel = struct {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         return std.mem.eql(u8, trimmed, "exit") or
             std.mem.eql(u8, trimmed, "quit") or
+            std.mem.eql(u8, trimmed, ":q") or
             std.mem.eql(u8, trimmed, "/quit") or
             std.mem.eql(u8, trimmed, "/exit");
     }
@@ -87,6 +88,103 @@ pub const CliChannel = struct {
     }
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// History — persistent REPL command history (~/.nullclaw_history)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MAX_HISTORY_LINES: usize = 1000;
+
+/// Load command history from a file (one command per line).
+/// Returns up to MAX_HISTORY_LINES most recent entries.
+/// If the file does not exist, returns an empty slice.
+/// Caller owns the returned slice and all strings within it.
+pub fn loadHistory(allocator: std.mem.Allocator, path: []const u8) ![][]const u8 {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return try allocator.alloc([]const u8, 0),
+        else => return err,
+    };
+    defer file.close();
+
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (lines.items) |l| allocator.free(l);
+        lines.deinit(allocator);
+    }
+
+    var read_buf: [8192]u8 = undefined;
+    var carry: std.ArrayListUnmanaged(u8) = .empty;
+    defer carry.deinit(allocator);
+
+    while (true) {
+        const n = file.read(&read_buf) catch break;
+        if (n == 0) break;
+        const data = read_buf[0..n];
+
+        var start: usize = 0;
+        for (data, 0..) |byte, i| {
+            if (byte == '\n') {
+                const segment = data[start..i];
+                if (carry.items.len > 0) {
+                    try carry.appendSlice(allocator, segment);
+                    if (carry.items.len > 0) {
+                        try lines.append(allocator, try allocator.dupe(u8, carry.items));
+                    }
+                    carry.clearRetainingCapacity();
+                } else if (segment.len > 0) {
+                    try lines.append(allocator, try allocator.dupe(u8, segment));
+                }
+                start = i + 1;
+            }
+        }
+        // Leftover bytes (no newline yet)
+        if (start < data.len) {
+            try carry.appendSlice(allocator, data[start..]);
+        }
+    }
+
+    // Trailing content without final newline
+    if (carry.items.len > 0) {
+        try lines.append(allocator, try allocator.dupe(u8, carry.items));
+    }
+
+    // Keep only the most recent MAX_HISTORY_LINES
+    if (lines.items.len > MAX_HISTORY_LINES) {
+        const excess = lines.items.len - MAX_HISTORY_LINES;
+        for (lines.items[0..excess]) |l| allocator.free(l);
+        std.mem.copyForwards([]const u8, lines.items[0..MAX_HISTORY_LINES], lines.items[excess..]);
+        lines.shrinkRetainingCapacity(MAX_HISTORY_LINES);
+    }
+
+    return lines.toOwnedSlice(allocator);
+}
+
+/// Free history entries returned by loadHistory.
+pub fn freeHistory(allocator: std.mem.Allocator, history: [][]const u8) void {
+    for (history) |entry| allocator.free(entry);
+    allocator.free(history);
+}
+
+/// Save command history to a file (one command per line).
+/// Writes at most MAX_HISTORY_LINES entries.
+pub fn saveHistory(history: []const []const u8, path: []const u8) !void {
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    const start = if (history.len > MAX_HISTORY_LINES) history.len - MAX_HISTORY_LINES else 0;
+    for (history[start..]) |entry| {
+        file.writeAll(entry) catch return;
+        file.writeAll("\n") catch return;
+    }
+}
+
+/// Resolve the default history file path (~/.nullclaw_history).
+/// Caller owns the returned string.
+pub fn defaultHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return std.fmt.allocPrint(allocator, "{s}/.nullclaw_history", .{home});
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -94,9 +192,75 @@ pub const CliChannel = struct {
 test "cli quit commands" {
     try std.testing.expect(CliChannel.isQuitCommand("exit"));
     try std.testing.expect(CliChannel.isQuitCommand("quit"));
+    try std.testing.expect(CliChannel.isQuitCommand(":q"));
     try std.testing.expect(CliChannel.isQuitCommand("/quit"));
     try std.testing.expect(CliChannel.isQuitCommand("/exit"));
     try std.testing.expect(CliChannel.isQuitCommand("  exit  "));
+    try std.testing.expect(CliChannel.isQuitCommand("  :q  "));
     try std.testing.expect(!CliChannel.isQuitCommand("hello"));
     try std.testing.expect(!CliChannel.isQuitCommand(""));
+}
+
+test "loadHistory reads file lines" {
+    const allocator = std.testing.allocator;
+
+    // Write a temporary history file
+    const tmp_path = "/tmp/nullclaw_test_history";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("hello world\nhow are you\ngoodbye\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const history = try loadHistory(allocator, tmp_path);
+    defer freeHistory(allocator, history);
+
+    try std.testing.expectEqual(@as(usize, 3), history.len);
+    try std.testing.expectEqualStrings("hello world", history[0]);
+    try std.testing.expectEqualStrings("how are you", history[1]);
+    try std.testing.expectEqualStrings("goodbye", history[2]);
+}
+
+test "loadHistory returns empty for missing file" {
+    const allocator = std.testing.allocator;
+    const history = try loadHistory(allocator, "/tmp/nullclaw_nonexistent_history_file");
+    defer freeHistory(allocator, history);
+    try std.testing.expectEqual(@as(usize, 0), history.len);
+}
+
+test "saveHistory writes file" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_save_history";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const entries = [_][]const u8{ "first", "second", "third" };
+    try saveHistory(&entries, tmp_path);
+
+    // Read back and verify
+    const loaded = try loadHistory(allocator, tmp_path);
+    defer freeHistory(allocator, loaded);
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("first", loaded[0]);
+    try std.testing.expectEqualStrings("second", loaded[1]);
+    try std.testing.expectEqualStrings("third", loaded[2]);
+}
+
+test "saveHistory and loadHistory roundtrip" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_roundtrip_history";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Save
+    const entries = [_][]const u8{ "alpha", "beta" };
+    try saveHistory(&entries, tmp_path);
+
+    // Load
+    const loaded = try loadHistory(allocator, tmp_path);
+    defer freeHistory(allocator, loaded);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqualStrings("alpha", loaded[0]);
+    try std.testing.expectEqualStrings("beta", loaded[1]);
 }

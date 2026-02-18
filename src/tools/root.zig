@@ -38,6 +38,8 @@ pub const web_search = @import("web_search.zig");
 pub const web_fetch = @import("web_fetch.zig");
 pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
+pub const i2c = @import("i2c.zig");
+pub const spi = @import("spi.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -254,6 +256,10 @@ pub fn allTools(
         const hmt = try allocator.create(hardware_memory.HardwareMemoryTool);
         hmt.* = .{ .boards = boards };
         try list.append(allocator, hmt.tool());
+
+        const i2ct = try allocator.create(i2c.I2cTool);
+        i2ct.* = .{};
+        try list.append(allocator, i2ct.tool());
     }
 
     // MCP tools (pre-initialized externally)
