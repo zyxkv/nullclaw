@@ -82,14 +82,17 @@ pub const BrowserTool = struct {
             return ToolResult.fail("Only https:// URLs are supported for security");
         }
 
-        // Block shell metacharacters in URL to prevent command injection via
-        // cmd.exe /c start (Windows) or shell interpretation.
-        for (url) |c| {
-            if (c == '&' or c == '|' or c == ';' or c == '"' or c == '\'' or
-                c == '<' or c == '>' or c == '`' or c == '(' or c == ')' or
-                c == '^' or c == '%' or c == '!' or c == '\n' or c == '\r')
-            {
-                return ToolResult.fail("URL contains shell metacharacters — open manually for safety");
+        // On Windows cmd.exe /c start interprets shell metacharacters in the URL.
+        // On Unix, open/xdg-open receives the URL as a separate argv element (execvp),
+        // so metacharacters like & (query params) and % (percent-encoding) are safe.
+        if (comptime builtin.os.tag == .windows) {
+            for (url) |c| {
+                if (c == '&' or c == '|' or c == ';' or c == '"' or c == '\'' or
+                    c == '<' or c == '>' or c == '`' or c == '(' or c == ')' or
+                    c == '^' or c == '%' or c == '!' or c == '\n' or c == '\r')
+                {
+                    return ToolResult.fail("URL contains shell metacharacters — open manually for safety");
+                }
             }
         }
 
@@ -334,7 +337,11 @@ test "browser tool execute with empty json" {
     try std.testing.expect(!result.success);
 }
 
-test "browser open rejects URL with shell metacharacters" {
+test "browser open rejects URL with shell metacharacters on Windows" {
+    // On Windows, cmd.exe /c start interprets metacharacters — they must be blocked.
+    // On Unix, open/xdg-open uses execvp so metacharacters in argv are safe.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
     var bt = BrowserTool{};
     const t = bt.tool();
 
@@ -350,4 +357,18 @@ test "browser open rejects URL with shell metacharacters" {
     defer p2.deinit();
     const r2 = try t.execute(std.testing.allocator, p2.value.object);
     try std.testing.expect(!r2.success);
+}
+
+test "browser open allows URL with query params on Unix" {
+    // On Unix, & in query strings is safe (passed as argv to open/xdg-open).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"open\", \"url\": \"https://example.com/search?a=1&b=2\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "example.com") != null);
 }

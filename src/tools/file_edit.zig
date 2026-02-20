@@ -416,24 +416,40 @@ test "isResolvedPathAllowed rejects partial prefix match" {
 }
 
 test "isResolvedPathAllowed blocks system paths" {
-    try std.testing.expect(!isResolvedPathAllowed(
-        std.testing.allocator,
-        "/etc/passwd",
-        "/etc",
-        &.{},
-    ));
-    try std.testing.expect(!isResolvedPathAllowed(
-        std.testing.allocator,
-        "/System/Library/something",
-        "/home/ws",
-        &.{"/System"},
-    ));
-    try std.testing.expect(!isResolvedPathAllowed(
-        std.testing.allocator,
-        "/bin/sh",
-        "/home/ws",
-        &.{"/bin"},
-    ));
+    if (comptime @import("builtin").os.tag == .windows) {
+        // Windows uses its own SYSTEM_BLOCKED_PREFIXES (C:\Windows, etc.)
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "C:\\Windows\\system32\\cmd.exe",
+            "C:\\Users\\ws",
+            &.{},
+        ));
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "C:\\Program Files\\app\\evil.exe",
+            "C:\\Users\\ws",
+            &.{},
+        ));
+    } else {
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "/etc/passwd",
+            "/etc",
+            &.{},
+        ));
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "/System/Library/something",
+            "/home/ws",
+            &.{"/System"},
+        ));
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "/bin/sh",
+            "/home/ws",
+            &.{"/bin"},
+        ));
+    }
 }
 
 test "isResolvedPathAllowed allows via allowed_paths" {

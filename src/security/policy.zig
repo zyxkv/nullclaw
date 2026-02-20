@@ -443,7 +443,9 @@ fn hasParentDirComponent(path: []const u8) bool {
 /// On Unix uses zero-allocation std.posix.getenv; on Windows falls back to
 /// page_allocator (acceptable since daemon mode is not yet supported there).
 fn expandTilde(path: []const u8, buf: []u8) []const u8 {
-    if (path.len < 2 or path[0] != '~' or (path[1] != '/' and path[1] != '\\')) return path;
+    if (path.len < 2 or path[0] != '~') return path;
+    const is_sep = path[1] == '/' or (comptime @import("builtin").os.tag == .windows and path[1] == '\\');
+    if (!is_sep) return path;
 
     if (comptime @import("builtin").os.tag == .windows) {
         const home = platform.getEnvOrNull(std.heap.page_allocator, "USERPROFILE") orelse return path;
@@ -761,9 +763,16 @@ test "absolute paths allowed when not workspace only" {
 }
 
 test "forbidden paths blocked" {
+    const builtin_mod = @import("builtin");
     const p = SecurityPolicy{ .workspace_only = false };
-    try std.testing.expect(!p.isPathAllowed("/etc/passwd"));
-    try std.testing.expect(!p.isPathAllowed("/root/.bashrc"));
+    if (comptime builtin_mod.os.tag == .windows) {
+        try std.testing.expect(!p.isPathAllowed("C:\\Windows\\system32\\cmd.exe"));
+        try std.testing.expect(!p.isPathAllowed("C:\\ProgramData\\secret"));
+    } else {
+        try std.testing.expect(!p.isPathAllowed("/etc/passwd"));
+        try std.testing.expect(!p.isPathAllowed("/root/.bashrc"));
+    }
+    // Tilde paths are in both platform lists
     try std.testing.expect(!p.isPathAllowed("~/.ssh/id_rsa"));
     try std.testing.expect(!p.isPathAllowed("~/.gnupg/pubring.kbx"));
 }
@@ -970,6 +979,7 @@ test "tilde paths handled" {
 }
 
 test "forbidden paths include critical system dirs" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const p = SecurityPolicy{ .workspace_only = false };
     try std.testing.expect(!p.isPathAllowed("/etc/shadow"));
     try std.testing.expect(!p.isPathAllowed("/proc/1/status"));
@@ -1067,14 +1077,23 @@ test "default allowed commands includes expected tools" {
 }
 
 test "default forbidden paths includes sensitive dirs" {
-    const builtin = @import("builtin");
+    const builtin_mod = @import("builtin");
     var found_ssh = false;
     for (default_forbidden_paths) |path| {
         if (std.mem.eql(u8, path, "~/.ssh")) found_ssh = true;
     }
     try std.testing.expect(found_ssh);
 
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin_mod.os.tag == .windows) {
+        var found_windows = false;
+        var found_progfiles = false;
+        for (default_forbidden_paths) |path| {
+            if (std.mem.eql(u8, path, "C:\\Windows")) found_windows = true;
+            if (std.mem.eql(u8, path, "C:\\Program Files")) found_progfiles = true;
+        }
+        try std.testing.expect(found_windows);
+        try std.testing.expect(found_progfiles);
+    } else {
         var found_etc = false;
         var found_proc = false;
         for (default_forbidden_paths) |path| {

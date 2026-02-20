@@ -46,18 +46,12 @@ pub fn getTempDir(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Returns the platform shell for executing commands.
 pub fn getShell() []const u8 {
-    return if (comptime builtin.os.tag == .windows) "cmd.exe" else "sh";
+    return if (comptime builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
 }
 
 /// Returns the shell flag for passing a command string.
 pub fn getShellFlag() []const u8 {
     return if (comptime builtin.os.tag == .windows) "/c" else "-c";
-}
-
-/// Test helper: skip the current test on Windows.
-/// Use for tests that rely on POSIX-only filesystem layout (/tmp, /dev, etc.).
-pub fn skipOnWindows() error{SkipZigTest}!void {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 }
 
 // ── Tests ────────────────────────────────────────────────────────
