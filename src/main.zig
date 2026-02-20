@@ -19,6 +19,7 @@ const Command = enum {
     daemon,
     service,
     status,
+    version,
     onboard,
     doctor,
     cron,
@@ -38,6 +39,8 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "daemon", .daemon },
         .{ "service", .service },
         .{ "status", .status },
+        .{ "version", .version },
+        .{ "-v", .version },
         .{ "onboard", .onboard },
         .{ "doctor", .doctor },
         .{ "cron", .cron },
@@ -81,6 +84,7 @@ pub fn main() !void {
     const sub_args = args[2..];
 
     switch (cmd) {
+        .version => printVersion(),
         .status => try yc.status.run(allocator),
         .agent => try yc.agent.run(allocator, sub_args),
         .onboard => try runOnboard(allocator, sub_args),
@@ -97,6 +101,10 @@ pub fn main() !void {
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
     }
+}
+
+fn printVersion() void {
+    std.debug.print("nullclaw {s}\n", .{yc.version.string});
 }
 
 // ── Gateway ──────────────────────────────────────────────────────
@@ -1220,6 +1228,7 @@ fn printUsage() void {
         \\  daemon      Start long-running runtime (gateway + channels + heartbeat)
         \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
         \\  status      Show system status
+        \\  version     Show CLI version
         \\  doctor      Run diagnostics
         \\  cron        Manage scheduled tasks
         \\  channel     Manage channels (Telegram, Discord, Slack, ...)
@@ -1235,6 +1244,7 @@ fn printUsage() void {
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  daemon [--port PORT] [--host HOST]
+        \\  version | -v
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS]
         \\  channel <list|start|doctor|add|remove> [ARGS]
@@ -1251,6 +1261,7 @@ fn printUsage() void {
 test "parse known commands" {
     try std.testing.expectEqual(.agent, parseCommand("agent").?);
     try std.testing.expectEqual(.status, parseCommand("status").?);
+    try std.testing.expectEqual(.version, parseCommand("version").?);
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
