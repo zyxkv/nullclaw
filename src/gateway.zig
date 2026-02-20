@@ -620,7 +620,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     defer state.deinit();
 
     // Load config and set up in-process SessionManager (graceful degradation if no config).
-    const config_opt: ?Config = Config.load(allocator) catch null;
+    var config_opt: ?Config = Config.load(allocator) catch null;
+    defer if (config_opt) |*c| c.deinit();
 
     // ProviderHolder: concrete provider struct must outlive the accept loop.
     const ProviderHolder = union(enum) {

@@ -8,12 +8,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var bw = std.fs.File.stdout().writer(&buf);
     const w = &bw.interface;
 
-    const cfg = Config.load(allocator) catch {
+    var cfg = Config.load(allocator) catch {
         try w.print("nullclaw Status (no config found -- run `nullclaw onboard` first)\n", .{});
         try w.print("\nVersion: {s}\n", .{version});
         try w.flush();
         return;
     };
+    defer cfg.deinit();
 
     try w.print("nullclaw Status\n\n", .{});
     try w.print("Version:     {s}\n", .{version});

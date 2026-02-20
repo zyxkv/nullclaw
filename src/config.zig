@@ -113,6 +113,7 @@ pub const Config = struct {
     max_actions_per_hour: u32 = 20,
 
     allocator: std.mem.Allocator,
+    arena: ?*std.heap.ArenaAllocator = null,
 
     /// Look up a provider's API key from the providers list.
     pub fn getProviderKey(self: *const Config, name: []const u8) ?[]const u8 {
@@ -148,12 +149,20 @@ pub const Config = struct {
         self.max_actions_per_hour = self.autonomy.max_actions_per_hour;
     }
 
-    pub fn load(allocator: std.mem.Allocator) !Config {
+    pub fn load(backing_allocator: std.mem.Allocator) !Config {
+        // Use an arena so deinit() can free everything in one shot.
+        const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
+        arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
+        errdefer {
+            arena_ptr.deinit();
+            backing_allocator.destroy(arena_ptr);
+        }
+        const allocator = arena_ptr.allocator();
+
         const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => return error.NoHomeDir,
             else => return err,
         };
-        defer allocator.free(home);
 
         const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
@@ -163,13 +172,13 @@ pub const Config = struct {
             .workspace_dir = workspace_dir,
             .config_path = config_path,
             .allocator = allocator,
+            .arena = arena_ptr,
         };
 
         // Try to read existing config file
         if (std.fs.openFileAbsolute(config_path, .{})) |file| {
             defer file.close();
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
-            defer allocator.free(content);
             cfg.parseJson(content) catch {};
         } else |_| {
             // Config file doesn't exist yet — use defaults
@@ -182,6 +191,17 @@ pub const Config = struct {
         cfg.syncFlatFields();
 
         return cfg;
+    }
+
+    /// Free all memory owned by this config (arena + heap pointer).
+    /// No-op for configs created without load() (e.g. in tests).
+    pub fn deinit(self: *Config) void {
+        if (self.arena) |arena| {
+            const backing = arena.child_allocator;
+            arena.deinit();
+            backing.destroy(arena);
+            self.arena = null;
+        }
     }
 
     /// Parse a JSON array of strings into an allocated slice.

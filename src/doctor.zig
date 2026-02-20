@@ -113,11 +113,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
 
-    if (Config.load(allocator)) |cfg| {
-        try runDoctor(allocator, &cfg, stdout);
-    } else |_| {
+    var cfg = Config.load(allocator) catch {
         try stdout.writeAll("[ERR] No config found -- run `nullclaw onboard` first\n");
-    }
+        try stdout.flush();
+        return;
+    };
+    defer cfg.deinit();
+    try runDoctor(allocator, &cfg, stdout);
     try stdout.flush();
 }
 
@@ -612,11 +614,11 @@ fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.A
 
 /// Check a specific diagnostic (utility for programmatic access).
 pub fn checkConfig(allocator: std.mem.Allocator) DiagResult {
-    if (Config.load(allocator)) |_| {
-        return .{ .name = "config", .ok = true, .message = "Config loaded" };
-    } else |_| {
+    var cfg = Config.load(allocator) catch {
         return .{ .name = "config", .ok = false, .message = "No config found" };
-    }
+    };
+    cfg.deinit();
+    return .{ .name = "config", .ok = true, .message = "Config loaded" };
 }
 
 // ── Tests ────────────────────────────────────────────────────────

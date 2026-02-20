@@ -99,10 +99,11 @@ pub fn main() !void {
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    const cfg = yc.config.Config.load(allocator) catch {
+    var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
+    defer cfg.deinit();
 
     // Config values are the baseline; CLI flags override them.
     var port: u16 = cfg.gateway.port;
@@ -128,10 +129,11 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // ── Daemon ───────────────────────────────────────────────────────
 
 fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    const cfg = yc.config.Config.load(allocator) catch {
+    var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
+    defer cfg.deinit();
 
     // Config values are the baseline; CLI flags override them.
     var port: u16 = cfg.gateway.port;
@@ -179,10 +181,11 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    const cfg = yc.config.Config.load(allocator) catch {
+    var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
+    defer cfg.deinit();
 
     try yc.service.handleCommand(allocator, service_cmd, cfg.config_path);
 }
@@ -305,10 +308,11 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
     const subcmd = sub_args[0];
 
-    const cfg = yc.config.Config.load(allocator) catch {
+    var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
+    defer cfg.deinit();
 
     if (std.mem.eql(u8, subcmd, "list")) {
         std.debug.print("Configured channels:\n", .{});
@@ -369,10 +373,11 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    const cfg = yc.config.Config.load(allocator) catch {
+    var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
+    defer cfg.deinit();
 
     const subcmd = sub_args[0];
 
@@ -539,10 +544,11 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             }
         }
 
-        const cfg = yc.config.Config.load(allocator) catch {
+        var cfg = yc.config.Config.load(allocator) catch {
             std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
             std.process.exit(1);
         };
+        defer cfg.deinit();
 
         const stats = yc.migration.migrateOpenclaw(allocator, &cfg, source_path, dry_run) catch |err| {
             std.debug.print("Migration failed: {s}\n", .{@errorName(err)});
@@ -579,10 +585,11 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        const cfg = yc.config.Config.load(allocator) catch null;
+        var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+        defer if (cfg_opt) |*c| c.deinit();
 
         std.debug.print("Current configuration:\n", .{});
-        if (cfg) |c| {
+        if (cfg_opt) |c| {
             std.debug.print("  Provider: {s}\n", .{c.default_provider});
             std.debug.print("  Model:    {s}\n", .{c.default_model orelse "(not set)"});
             std.debug.print("  Temp:     {d:.1}\n\n", .{c.default_temperature});
@@ -655,10 +662,11 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Load config
-    const config = yc.config.Config.load(allocator) catch {
+    var config = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
+    defer config.deinit();
 
     const telegram_config = config.channels.telegram orelse {
         std.debug.print("Telegram not configured. Add to config.json:\n", .{});

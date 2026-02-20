@@ -125,11 +125,10 @@ pub const DelegateTool = struct {
         }
 
         // Fallback: no agent config found — load global config
-        var cfg_arena = std.heap.ArenaAllocator.init(allocator);
-        defer cfg_arena.deinit();
-        const cfg = Config.load(cfg_arena.allocator()) catch {
+        var cfg = Config.load(allocator) catch {
             return ToolResult.fail("Failed to load config — run `nullclaw onboard` first");
         };
+        defer cfg.deinit();
 
         const agent_prompt = std.fmt.allocPrint(
             allocator,

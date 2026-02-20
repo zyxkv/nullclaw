@@ -407,6 +407,26 @@ pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![
     return result.toOwnedSlice(allocator);
 }
 
+// ── Fresh config with arena ──────────────────────────────────────
+
+/// Create a fresh Config backed by an arena (for when Config.load() fails).
+/// Caller must call cfg.deinit() when done.
+fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
+    const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer {
+        arena_ptr.deinit();
+        backing_allocator.destroy(arena_ptr);
+    }
+    const allocator = arena_ptr.allocator();
+    return Config{
+        .workspace_dir = try getDefaultWorkspace(allocator),
+        .config_path = try getDefaultConfigPath(allocator),
+        .allocator = allocator,
+        .arena = arena_ptr,
+    };
+}
+
 // ── Quick setup ──────────────────────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config.
@@ -418,25 +438,15 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     try stdout.writeAll("  Quick Setup -- generating config with sensible defaults...\n\n");
 
     // Load or create config
-    var cfg = Config.load(allocator) catch Config{
-        .workspace_dir = try getDefaultWorkspace(allocator),
-        .config_path = try getDefaultConfigPath(allocator),
-        .allocator = allocator,
-    };
+    var cfg = Config.load(allocator) catch try initFreshConfig(allocator);
+    defer cfg.deinit();
 
     // Apply overrides
     if (provider) |p| cfg.default_provider = p;
     if (api_key) |key| {
-        // Free old providers if previously loaded from config
-        for (cfg.providers) |e| {
-            allocator.free(e.name);
-            if (e.api_key) |k| allocator.free(k);
-            if (e.base_url) |b| allocator.free(b);
-        }
-        if (cfg.providers.len > 0) allocator.free(cfg.providers);
-        // Store in providers section for the default provider
-        const entries = try allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try allocator.dupe(u8, cfg.default_provider), .api_key = key };
+        // Store in providers section for the default provider (arena frees old values)
+        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .api_key = key };
         cfg.providers = entries;
     }
     if (memory_backend) |mb| cfg.memory.backend = mb;
@@ -497,11 +507,12 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     const stdout = &bw.interface;
     try stdout.writeAll("Channel configuration status:\n\n");
 
-    const cfg = Config.load(allocator) catch {
+    var cfg = Config.load(allocator) catch {
         try stdout.writeAll("No existing config found. Run `nullclaw onboard` first.\n");
         try stdout.flush();
         return error.ConfigNotFound;
     };
+    defer cfg.deinit();
 
     try stdout.print("  CLI:       {s}\n", .{if (cfg.channels.cli) "enabled" else "disabled"});
     try stdout.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram != null) "configured" else "not configured"});
@@ -565,11 +576,8 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     var input_buf: [512]u8 = undefined;
 
     // Load existing or create fresh config
-    var cfg = Config.load(allocator) catch Config{
-        .workspace_dir = try getDefaultWorkspace(allocator),
-        .config_path = try getDefaultConfigPath(allocator),
-        .allocator = allocator,
-    };
+    var cfg = Config.load(allocator) catch try initFreshConfig(allocator);
+    defer cfg.deinit();
 
     // ── Step 1: Provider selection ──
     try out.writeAll("  Step 1/8: Select a provider\n");
@@ -595,15 +603,9 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         return;
     };
     if (api_key_input.len > 0) {
-        // Free old providers if previously loaded from config
-        for (cfg.providers) |e| {
-            allocator.free(e.name);
-            if (e.api_key) |k| allocator.free(k);
-            if (e.base_url) |b| allocator.free(b);
-        }
-        if (cfg.providers.len > 0) allocator.free(cfg.providers);
-        const entries = try allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try allocator.dupe(u8, cfg.default_provider), .api_key = try allocator.dupe(u8, api_key_input) };
+        // Store in providers section (arena frees old values)
+        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .api_key = try cfg.allocator.dupe(u8, api_key_input) };
         cfg.providers = entries;
         try out.writeAll("  -> API key set\n\n");
     } else {
@@ -652,7 +654,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         }
     } else |_| {
         // Free-form model name typed by user
-        cfg.default_model = try allocator.dupe(u8, model_input);
+        cfg.default_model = try cfg.allocator.dupe(u8, model_input);
     }
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
 
@@ -723,7 +725,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         return;
     };
     if (ws_input.len > 0) {
-        cfg.workspace_dir = try allocator.dupe(u8, ws_input);
+        cfg.workspace_dir = try cfg.allocator.dupe(u8, ws_input);
     }
     try out.print("  -> {s}\n\n", .{cfg.workspace_dir});
 
