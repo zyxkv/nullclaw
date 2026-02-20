@@ -36,15 +36,29 @@ pub const OpenAiProvider = struct {
         model: []const u8,
         temperature: f64,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":\"");
+        try buf.appendSlice(allocator, model);
+        try buf.appendSlice(allocator, "\",\"messages\":[");
+
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"system","content":"{s}"}},{{"role":"user","content":"{s}"}}],"temperature":{d:.2}}}
-            , .{ model, sys, message, temperature });
+            try buf.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
+            try root.appendJsonString(&buf, allocator, sys);
+            try buf.appendSlice(allocator, "},{\"role\":\"user\",\"content\":");
+            try root.appendJsonString(&buf, allocator, message);
+            try buf.append(allocator, '}');
         } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"temperature":{d:.2}}}
-            , .{ model, message, temperature });
+            try buf.appendSlice(allocator, "{\"role\":\"user\",\"content\":");
+            try root.appendJsonString(&buf, allocator, message);
+            try buf.append(allocator, '}');
         }
+
+        try buf.append(allocator, ']');
+        try appendGenerationFields(&buf, allocator, model, temperature, null);
+        try buf.append(allocator, '}');
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Parse text content from an OpenAI chat completions response.
@@ -235,6 +249,43 @@ pub const OpenAiProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 
+    fn isGpt5Model(model: []const u8) bool {
+        return std.mem.startsWith(u8, model, "gpt-5");
+    }
+
+    /// Append model-specific generation controls:
+    /// - non-gpt-5: `temperature` + optional `max_tokens`
+    /// - gpt-5*: optional `max_completion_tokens` only
+    fn appendGenerationFields(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        model: []const u8,
+        temperature: f64,
+        max_tokens: ?u32,
+    ) !void {
+        if (!isGpt5Model(model)) {
+            try buf.appendSlice(allocator, ",\"temperature\":");
+            var temp_buf: [16]u8 = undefined;
+            const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.OpenAiApiError;
+            try buf.appendSlice(allocator, temp_str);
+
+            if (max_tokens) |max_tok| {
+                try buf.appendSlice(allocator, ",\"max_tokens\":");
+                var max_buf: [16]u8 = undefined;
+                const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.OpenAiApiError;
+                try buf.appendSlice(allocator, max_str);
+            }
+            return;
+        }
+
+        if (max_tokens) |max_tok| {
+            try buf.appendSlice(allocator, ",\"max_completion_tokens\":");
+            var max_buf: [16]u8 = undefined;
+            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.OpenAiApiError;
+            try buf.appendSlice(allocator, max_str);
+        }
+    }
+
     /// Build a streaming chat request JSON body (same as buildChatRequestBody but with "stream":true).
     fn buildStreamingChatRequestBody(
         allocator: std.mem.Allocator,
@@ -262,15 +313,8 @@ pub const OpenAiProvider = struct {
             try buf.append(allocator, '}');
         }
 
-        try buf.appendSlice(allocator, "],\"temperature\":");
-        var temp_buf: [16]u8 = undefined;
-        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.OpenAiApiError;
-        try buf.appendSlice(allocator, temp_str);
-
-        try buf.appendSlice(allocator, ",\"max_tokens\":");
-        var max_buf: [16]u8 = undefined;
-        const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{request.max_tokens}) catch return error.OpenAiApiError;
-        try buf.appendSlice(allocator, max_str);
+        try buf.append(allocator, ']');
+        try appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -311,15 +355,8 @@ pub const OpenAiProvider = struct {
             try buf.append(allocator, '}');
         }
 
-        try buf.appendSlice(allocator, "],\"temperature\":");
-        var temp_buf: [16]u8 = undefined;
-        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.OpenAiApiError;
-        try buf.appendSlice(allocator, temp_str);
-
-        try buf.appendSlice(allocator, ",\"max_tokens\":");
-        var max_buf: [16]u8 = undefined;
-        const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{request.max_tokens}) catch return error.OpenAiApiError;
-        try buf.appendSlice(allocator, max_str);
+        try buf.append(allocator, ']');
+        try appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -351,6 +388,12 @@ test "buildRequestBody with system" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "You are helpful") != null);
+}
+
+test "buildRequestBody gpt-5 omits temperature" {
+    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5.2", 0.1);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
 }
 
 test "parseTextResponse single choice" {
@@ -468,6 +511,41 @@ test "buildRequestBody includes temperature zero" {
     const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4o", 0.0);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "0.00") != null);
+}
+
+test "buildChatRequestBody gpt-5 uses max_completion_tokens" {
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "gpt-5.2",
+        .temperature = 0.2,
+        .max_tokens = 42,
+    };
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-5.2", 0.2);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
+}
+
+test "buildStreamingChatRequestBody gpt-5 uses max_completion_tokens" {
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "gpt-5.2",
+        .temperature = 0.2,
+        .max_tokens = 64,
+    };
+    const body = try OpenAiProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "gpt-5.2", 0.2);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
 }
 
 test "provider getName returns OpenAI" {
