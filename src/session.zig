@@ -20,6 +20,7 @@ const observability = @import("observability.zig");
 const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
+const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
@@ -51,6 +52,7 @@ pub const SessionManager = struct {
     tools: []const Tool,
     mem: ?Memory,
     observer: Observer,
+    policy: ?*const SecurityPolicy = null,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -101,15 +103,18 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(Session);
         errdefer self.allocator.destroy(session);
 
+        var agent = try Agent.fromConfig(
+            self.allocator,
+            self.config,
+            self.provider,
+            self.tools,
+            self.mem,
+            self.observer,
+        );
+        agent.policy = self.policy;
+
         session.* = .{
-            .agent = try Agent.fromConfig(
-                self.allocator,
-                self.config,
-                self.provider,
-                self.tools,
-                self.mem,
-                self.observer,
-            ),
+            .agent = agent,
             .created_at = std.time.timestamp(),
             .last_active = std.time.timestamp(),
             .last_consolidated = 0,

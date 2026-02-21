@@ -16,6 +16,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const cli_mod = @import("../channels/cli.zig");
+const security = @import("../security/policy.zig");
 
 const Agent = @import("root.zig").Agent;
 
@@ -80,6 +81,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     else
         null;
 
+    // Build security policy from config
+    var tracker = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
+    defer tracker.deinit();
+
+    var policy = security.SecurityPolicy{
+        .autonomy = cfg.autonomy.level,
+        .workspace_dir = cfg.workspace_dir,
+        .workspace_only = cfg.autonomy.workspace_only,
+        .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+        .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+        .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+        .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+        .tracker = &tracker,
+    };
+
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
@@ -88,6 +104,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .agents = cfg.agents,
         .fallback_api_key = cfg.defaultProviderKey(),
         .tools_config = cfg.tools,
+        .allowed_paths = cfg.autonomy.allowed_paths,
+        .policy = &policy,
     });
     defer allocator.free(tools);
 
@@ -114,6 +132,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         try w.flush();
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
+        agent.policy = &policy;
         defer agent.deinit();
 
         // Enable streaming if provider supports it
@@ -183,6 +202,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
+    agent.policy = &policy;
     defer agent.deinit();
 
     // Enable streaming if provider supports it

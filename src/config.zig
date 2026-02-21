@@ -353,9 +353,8 @@ pub const Config = struct {
         try w.print("  \"autonomy\": {{\n", .{});
         try w.print("    \"level\": \"{s}\",\n", .{@tagName(self.autonomy.level)});
         try w.print("    \"workspace_only\": {s},\n", .{if (self.autonomy.workspace_only) "true" else "false"});
-        try w.print("    \"max_actions_per_hour\": {d},\n", .{self.autonomy.max_actions_per_hour});
         if (self.autonomy.allowed_paths.len > 0) {
-            try w.print("    \"max_cost_per_day_cents\": {d},\n", .{self.autonomy.max_cost_per_day_cents});
+            try w.print("    \"max_actions_per_hour\": {d},\n", .{self.autonomy.max_actions_per_hour});
             try w.print("    \"allowed_paths\": [", .{});
             for (self.autonomy.allowed_paths, 0..) |p, i| {
                 if (i > 0) try w.print(", ", .{});
@@ -363,7 +362,7 @@ pub const Config = struct {
             }
             try w.print("]\n", .{});
         } else {
-            try w.print("    \"max_cost_per_day_cents\": {d}\n", .{self.autonomy.max_cost_per_day_cents});
+            try w.print("    \"max_actions_per_hour\": {d}\n", .{self.autonomy.max_actions_per_hour});
         }
         try w.print("  }},\n", .{});
 
@@ -807,10 +806,10 @@ test "json parse integer temperature coerced to float" {
     try std.testing.expectEqual(@as(f64, 1.0), cfg.default_temperature);
 }
 
-test "json parse autonomy allowed commands and forbidden paths" {
+test "json parse autonomy allowed commands" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"autonomy": {"allowed_commands": ["ls", "cat", "git status"], "forbidden_paths": ["/etc/shadow", "/root/.ssh"]}}
+        \\{"autonomy": {"allowed_commands": ["ls", "cat", "git status"]}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -818,13 +817,8 @@ test "json parse autonomy allowed commands and forbidden paths" {
     try std.testing.expectEqualStrings("ls", cfg.autonomy.allowed_commands[0]);
     try std.testing.expectEqualStrings("cat", cfg.autonomy.allowed_commands[1]);
     try std.testing.expectEqualStrings("git status", cfg.autonomy.allowed_commands[2]);
-    try std.testing.expectEqual(@as(usize, 2), cfg.autonomy.forbidden_paths.len);
-    try std.testing.expectEqualStrings("/etc/shadow", cfg.autonomy.forbidden_paths[0]);
-    try std.testing.expectEqualStrings("/root/.ssh", cfg.autonomy.forbidden_paths[1]);
     for (cfg.autonomy.allowed_commands) |cmd| allocator.free(cmd);
     allocator.free(cfg.autonomy.allowed_commands);
-    for (cfg.autonomy.forbidden_paths) |p| allocator.free(p);
-    allocator.free(cfg.autonomy.forbidden_paths);
 }
 
 test "json parse autonomy allowed_paths" {
@@ -980,7 +974,7 @@ test "json parse all new fields together" {
         \\{
         \\  "model_routes": [{"hint": "fast", "provider": "groq", "model": "llama-3.3-70b"}],
         \\  "agents": {"list": [{"name": "helper", "provider": "anthropic", "model": "claude-haiku-3.5"}]},
-        \\  "autonomy": {"allowed_commands": ["ls"], "forbidden_paths": ["/root"]},
+        \\  "autonomy": {"allowed_commands": ["ls"]},
         \\  "gateway": {"paired_tokens": ["tok-1"]},
         \\  "browser": {"allowed_domains": ["example.com"]}
         \\}
@@ -990,7 +984,6 @@ test "json parse all new fields together" {
     try std.testing.expectEqual(@as(usize, 1), cfg.model_routes.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.autonomy.allowed_commands.len);
-    try std.testing.expectEqual(@as(usize, 1), cfg.autonomy.forbidden_paths.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.gateway.paired_tokens.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.browser.allowed_domains.len);
     // Cleanup
@@ -1004,8 +997,6 @@ test "json parse all new fields together" {
     allocator.free(cfg.agents);
     allocator.free(cfg.autonomy.allowed_commands[0]);
     allocator.free(cfg.autonomy.allowed_commands);
-    allocator.free(cfg.autonomy.forbidden_paths[0]);
-    allocator.free(cfg.autonomy.forbidden_paths);
     allocator.free(cfg.gateway.paired_tokens[0]);
     allocator.free(cfg.gateway.paired_tokens);
     allocator.free(cfg.browser.allowed_domains[0]);

@@ -761,6 +761,22 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     else
         null;
 
+    // Build security policy from config
+    const security = @import("nullclaw").security.policy;
+    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
+    defer tracker.deinit();
+
+    var sec_policy = security.SecurityPolicy{
+        .autonomy = config.autonomy.level,
+        .workspace_dir = config.workspace_dir,
+        .workspace_only = config.autonomy.workspace_only,
+        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
+        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
+        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .tracker = &tracker,
+    };
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
@@ -770,6 +786,8 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .agents = config.agents,
         .fallback_api_key = config.defaultProviderKey(),
         .tools_config = config.tools,
+        .allowed_paths = config.autonomy.allowed_paths,
+        .policy = &sec_policy,
     }) catch &.{};
     defer if (tools.len > 0) allocator.free(tools);
 
@@ -807,6 +825,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
     var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs);
+    session_mgr.policy = &sec_policy;
     defer session_mgr.deinit();
 
     var typing = yc.channels.telegram.TypingIndicator.init(&tg);

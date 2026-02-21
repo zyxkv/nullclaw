@@ -5,6 +5,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -21,6 +22,7 @@ pub const ShellTool = struct {
     allowed_paths: []const []const u8 = &.{},
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
+    policy: ?*const SecurityPolicy = null,
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
@@ -41,6 +43,17 @@ pub const ShellTool = struct {
         // Parse the command from the pre-parsed JSON object
         const command = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
+
+        // Validate command against security policy
+        if (self.policy) |pol| {
+            _ = pol.validateCommandExecution(command, false) catch |err| {
+                return switch (err) {
+                    error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
+                    error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
+                    error.ApprovalRequired => ToolResult.fail("Command requires approval (medium/high risk)"),
+                };
+            };
+        }
 
         // Determine working directory
         const effective_cwd = if (root.getString(args, "cwd")) |cwd| blk: {

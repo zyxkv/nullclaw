@@ -19,6 +19,7 @@ const Memory = memory_mod.Memory;
 const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
+const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
@@ -62,6 +63,9 @@ pub const Agent = struct {
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
+
+    /// Optional security policy for autonomy checks and rate limiting.
+    policy: ?*const SecurityPolicy = null,
 
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
@@ -696,6 +700,27 @@ pub const Agent = struct {
     /// Execute a tool by name lookup.
     /// Parses arguments_json once into a std.json.ObjectMap and passes it to the tool.
     fn executeTool(self: *Agent, call: ParsedToolCall) ToolExecutionResult {
+        // Policy gate: check autonomy and rate limit
+        if (self.policy) |pol| {
+            if (!pol.canAct()) {
+                return .{
+                    .name = call.name,
+                    .output = "Action blocked: agent is in read-only mode",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                };
+            }
+            const allowed = pol.recordAction() catch true;
+            if (!allowed) {
+                return .{
+                    .name = call.name,
+                    .output = "Rate limit exceeded",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                };
+            }
+        }
+
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
                 // Parse arguments JSON to ObjectMap ONCE

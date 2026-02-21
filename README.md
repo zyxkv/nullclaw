@@ -280,8 +280,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,
-    "max_actions_per_hour": 20,
-    "max_cost_per_day_cents": 500
+    "max_actions_per_hour": 20
   },
 
   "runtime": {

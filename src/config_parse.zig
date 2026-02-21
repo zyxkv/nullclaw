@@ -247,9 +247,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("max_actions_per_hour")) |v| {
                 if (v == .integer) self.autonomy.max_actions_per_hour = @intCast(v.integer);
             }
-            if (aut.object.get("max_cost_per_day_cents")) |v| {
-                if (v == .integer) self.autonomy.max_cost_per_day_cents = @intCast(v.integer);
-            }
+            // max_cost_per_day_cents: ignored (removed — never enforced at runtime)
             if (aut.object.get("require_approval_for_medium_risk")) |v| {
                 if (v == .bool) self.autonomy.require_approval_for_medium_risk = v.bool;
             }
@@ -258,21 +256,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (aut.object.get("level")) |v| {
                 if (v == .string) {
-                    if (std.mem.eql(u8, v.string, "read_only")) {
-                        self.autonomy.level = .read_only;
-                    } else if (std.mem.eql(u8, v.string, "supervised")) {
-                        self.autonomy.level = .supervised;
-                    } else if (std.mem.eql(u8, v.string, "full")) {
-                        self.autonomy.level = .full;
+                    if (types.AutonomyLevel.fromString(v.string)) |lvl| {
+                        self.autonomy.level = lvl;
                     }
                 }
             }
             if (aut.object.get("allowed_commands")) |v| {
                 if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
             }
-            if (aut.object.get("forbidden_paths")) |v| {
-                if (v == .array) self.autonomy.forbidden_paths = try parseStringArray(self.allocator, v.array);
-            }
+            // forbidden_paths: ignored (removed — path security handled by path_security.zig)
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
             }

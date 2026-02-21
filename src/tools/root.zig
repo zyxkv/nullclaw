@@ -254,6 +254,7 @@ pub fn allTools(
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
+        policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -268,6 +269,7 @@ pub fn allTools(
         .allowed_paths = opts.allowed_paths,
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
+        .policy = opts.policy,
     };
     try list.append(allocator, st.tool());
 
@@ -387,13 +389,14 @@ pub fn subagentTools(
     opts: struct {
         http_enabled: bool = false,
         allowed_paths: []const []const u8 = &.{},
+        policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
     errdefer list.deinit(allocator);
 
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .policy = opts.policy };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);

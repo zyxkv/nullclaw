@@ -81,6 +81,20 @@ pub fn isPathSafe(path: []const u8) bool {
     while (iter.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return false;
     }
+    // Block URL-encoded traversal (..%2f, %2f.., ..%5c, %5c..)
+    {
+        var lower: [4096]u8 = undefined;
+        if (path.len > lower.len) return false; // reject rather than silently truncate
+        const len = path.len;
+        for (path[0..len], 0..) |c, i| {
+            lower[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        const lp = lower[0..len];
+        if (std.mem.indexOf(u8, lp, "..%2f") != null or
+            std.mem.indexOf(u8, lp, "%2f..") != null or
+            std.mem.indexOf(u8, lp, "..%5c") != null or
+            std.mem.indexOf(u8, lp, "%5c..") != null) return false;
+    }
     return true;
 }
 
@@ -102,6 +116,21 @@ test "isPathSafe blocks traversal" {
 
 test "isPathSafe blocks absolute" {
     try std.testing.expect(!isPathSafe("/etc/passwd"));
+}
+
+test "isPathSafe blocks URL-encoded traversal" {
+    try std.testing.expect(!isPathSafe("..%2fetc/passwd"));
+    try std.testing.expect(!isPathSafe("%2f..%2fetc/passwd"));
+    try std.testing.expect(!isPathSafe("..%5c..%5cwindows"));
+    try std.testing.expect(!isPathSafe("%5c..%5csecret"));
+    // Case-insensitive
+    try std.testing.expect(!isPathSafe("..%2Fetc/passwd"));
+    try std.testing.expect(!isPathSafe("..%2fetc/passwd"));
+}
+
+test "isPathSafe allows percent in non-traversal context" {
+    try std.testing.expect(isPathSafe("file%20name.txt"));
+    try std.testing.expect(isPathSafe("100%25done.txt"));
 }
 
 test "isResolvedPathAllowed allows workspace path" {
