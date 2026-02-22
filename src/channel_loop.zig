@@ -56,11 +56,18 @@ pub const ChannelRuntime = struct {
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
+        // Resolve API key: config providers first, then env vars
+        const resolved_key = providers.resolveApiKeyFromConfig(
+            allocator,
+            config.default_provider,
+            config.providers,
+        ) catch null;
+
         // Provider — heap-allocated for vtable pointer stability
         const holder = try allocator.create(ProviderHolder);
         errdefer allocator.destroy(holder);
 
-        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey());
+        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key);
 
         const provider_i = holder.provider();
 
@@ -80,7 +87,7 @@ pub const ChannelRuntime = struct {
             .screenshot_enabled = true,
             .mcp_tools = mcp_tools,
             .agents = config.agents,
-            .fallback_api_key = config.defaultProviderKey(),
+            .fallback_api_key = resolved_key,
             .tools_config = config.tools,
         }) catch &.{};
         errdefer if (tools.len > 0) allocator.free(tools);

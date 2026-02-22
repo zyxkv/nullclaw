@@ -91,7 +91,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
     return map.get(name) orelse .{ "", "", "" };
 }
 
-/// Resolve API key with config providers as first priority:
+/// Resolve API key with config providers as first priority, then env vars:
 ///   1. providers[].api_key from config
 ///   2. Provider-specific env var (GROQ_API_KEY, etc.)
 ///   3. Generic fallbacks (NULLCLAW_API_KEY, API_KEY)
@@ -140,12 +140,11 @@ test "resolveApiKeyFromConfig finds key from providers" {
     try std.testing.expectEqualStrings("gsk_test", result.?);
 }
 
-test "resolveApiKeyFromConfig returns null for missing provider" {
+test "resolveApiKeyFromConfig falls through to env for missing provider" {
     const entries = [_]config_mod.ProviderEntry{
         .{ .name = "openrouter", .api_key = "sk-or-test" },
     };
-    // Without env var set, should fall through to env-based resolution
-    // which may or may not find a key — we just test it doesn't crash
+    // Falls through to env-based resolution (may or may not find a key)
     const result = try resolveApiKeyFromConfig(std.testing.allocator, "nonexistent", &entries);
     if (result) |r| std.testing.allocator.free(r);
 }
