@@ -133,13 +133,6 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
     cfg.gateway.host = host;
 }
 
-fn applyGatewayRuntimeProfile(cfg: *yc.config.Config) void {
-    // `nullclaw gateway` should match OpenClaw semantics:
-    // run gateway + all configured channels/accounts, but without background automation loops.
-    cfg.scheduler.enabled = false;
-    cfg.heartbeat.enabled = false;
-}
-
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -159,7 +152,6 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    applyGatewayRuntimeProfile(&cfg);
     try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
 
@@ -1850,22 +1842,6 @@ test "applyGatewayDaemonOverrides rejects invalid port" {
     };
     const args = [_][]const u8{ "--port", "bad" };
     try std.testing.expectError(error.InvalidPort, applyGatewayDaemonOverrides(&cfg, &args));
-}
-
-test "applyGatewayRuntimeProfile disables scheduler and heartbeat" {
-    var cfg = yc.config.Config{
-        .workspace_dir = "/tmp/nullclaw-test",
-        .config_path = "/tmp/nullclaw-test/config.json",
-        .default_model = "openrouter/auto",
-        .allocator = std.testing.allocator,
-    };
-    cfg.scheduler.enabled = true;
-    cfg.heartbeat.enabled = true;
-
-    applyGatewayRuntimeProfile(&cfg);
-
-    try std.testing.expect(!cfg.scheduler.enabled);
-    try std.testing.expect(!cfg.heartbeat.enabled);
 }
 
 test "hasConfiguredStartableChannels ignores cli and webhook-only defaults" {

@@ -85,11 +85,11 @@ nullclaw agent -m "Hello, nullclaw!"
 # Interactive mode
 nullclaw agent
 
-# Start gateway runtime (gateway + all configured channels/accounts)
+# Start gateway runtime (gateway + all configured channels/accounts + heartbeat + scheduler)
 nullclaw gateway                # default: 127.0.0.1:3000
 nullclaw gateway --port 8080    # custom port
 
-# Start full autonomous runtime (adds scheduler + heartbeat)
+# Alias (same runtime path)
 nullclaw daemon
 
 # Check status
