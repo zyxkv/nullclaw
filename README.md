@@ -64,6 +64,10 @@ ls -lh zig-out/bin/nullclaw
 
 ## Quick Start
 
+> **Prerequisite:** use **Zig 0.15.2** (exact version).
+> `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
+> Verify before building: `zig version` should print `0.15.2`.
+
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
 cd nullclaw
@@ -339,6 +343,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 ## Development
 
+Build and tests are pinned to **Zig 0.15.2**.
+
 ```bash
 zig build                          # Dev build
 zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
@@ -358,7 +364,7 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 ### Project Stats
 
 ```
-Language:     Zig 0.15
+Language:     Zig 0.15.2
 Source files: ~110
 Lines of code: ~45,000
 Tests:        3,230+
