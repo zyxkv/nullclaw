@@ -165,7 +165,7 @@ pub const SlackConfig = struct {
     app_token: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
-    dm_policy: []const u8 = "allow",
+    dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
 };
 

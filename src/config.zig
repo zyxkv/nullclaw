@@ -1349,6 +1349,7 @@ test "parse slack accounts" {
     const sc = cfg.channels.slack.?;
     try std.testing.expectEqualStrings("xoxb-123", sc.bot_token);
     try std.testing.expectEqualStrings("xapp-456", sc.app_token.?);
+    try std.testing.expectEqualStrings("pairing", sc.dm_policy);
     allocator.free(sc.bot_token);
     allocator.free(sc.app_token.?);
     for (sc.allow_from) |u| allocator.free(u);
