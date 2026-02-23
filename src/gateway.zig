@@ -13,6 +13,7 @@
 const std = @import("std");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
@@ -215,6 +216,9 @@ pub const GatewayState = struct {
     telegram_account_id: []const u8 = "default",
     telegram_allow_from: []const []const u8 = &.{},
     whatsapp_allow_from: []const []const u8 = &.{},
+    whatsapp_group_allow_from: []const []const u8 = &.{},
+    whatsapp_groups: []const []const u8 = &.{},
+    whatsapp_group_policy: []const u8 = "allowlist",
     line_channel_secret: []const u8 = "",
     line_access_token: []const u8 = "",
     line_account_id: []const u8 = "default",
@@ -569,6 +573,133 @@ pub fn jsonIntField(json: []const u8, key: []const u8) ?i64 {
     return if (is_negative) -result else result;
 }
 
+fn findWhatsAppConfigByVerifyToken(cfg: *const Config, verify_token: []const u8) ?*const config_types.WhatsAppConfig {
+    for (cfg.channels.whatsapp) |*wa_cfg| {
+        if (std.mem.eql(u8, wa_cfg.verify_token, verify_token)) return wa_cfg;
+    }
+    return null;
+}
+
+fn findWhatsAppConfigByPhoneNumberId(cfg: *const Config, phone_number_id: []const u8) ?*const config_types.WhatsAppConfig {
+    for (cfg.channels.whatsapp) |*wa_cfg| {
+        if (std.mem.eql(u8, wa_cfg.phone_number_id, phone_number_id)) return wa_cfg;
+    }
+    return null;
+}
+
+fn selectWhatsAppConfig(
+    cfg_opt: ?*const Config,
+    body: ?[]const u8,
+    verify_token: ?[]const u8,
+) ?*const config_types.WhatsAppConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.whatsapp.len == 0) return null;
+
+    if (verify_token) |token| {
+        if (findWhatsAppConfigByVerifyToken(cfg, token)) |wa_cfg| {
+            return wa_cfg;
+        }
+    }
+
+    if (body) |b| {
+        if (jsonStringField(b, "phone_number_id")) |phone_number_id| {
+            if (findWhatsAppConfigByPhoneNumberId(cfg, phone_number_id)) |wa_cfg| {
+                return wa_cfg;
+            }
+        }
+    }
+
+    return &cfg.channels.whatsapp[0];
+}
+
+fn findTelegramConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.TelegramConfig {
+    for (cfg.channels.telegram) |*tg_cfg| {
+        if (std.ascii.eqlIgnoreCase(tg_cfg.account_id, account_id)) return tg_cfg;
+    }
+    return null;
+}
+
+fn selectTelegramConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+) ?*const config_types.TelegramConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.telegram.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findTelegramConfigByAccountId(cfg, account_id)) |tg_cfg| {
+            return tg_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findTelegramConfigByAccountId(cfg, account_id)) |tg_cfg| {
+            return tg_cfg;
+        }
+    }
+
+    if (cfg.channels.telegramPrimary()) |primary| {
+        if (findTelegramConfigByAccountId(cfg, primary.account_id)) |tg_cfg| {
+            return tg_cfg;
+        }
+    }
+    return &cfg.channels.telegram[0];
+}
+
+fn hasLineSecrets(cfg: *const Config) bool {
+    for (cfg.channels.line) |line_cfg| {
+        if (line_cfg.channel_secret.len > 0) return true;
+    }
+    return false;
+}
+
+fn selectLineConfigBySignature(
+    cfg_opt: ?*const Config,
+    body: []const u8,
+    signature: ?[]const u8,
+) ?*const config_types.LineConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.line.len == 0) return null;
+
+    if (signature) |sig| {
+        for (cfg.channels.line) |*line_cfg| {
+            if (channels.line.LineChannel.verifySignature(body, sig, line_cfg.channel_secret)) {
+                return line_cfg;
+            }
+        }
+        return null;
+    }
+
+    return &cfg.channels.line[0];
+}
+
+fn findLarkConfigByVerificationToken(
+    cfg: *const Config,
+    verification_token: []const u8,
+) ?*const config_types.LarkConfig {
+    for (cfg.channels.lark) |*lark_cfg| {
+        if (std.mem.eql(u8, lark_cfg.verification_token orelse "", verification_token)) {
+            return lark_cfg;
+        }
+    }
+    return null;
+}
+
+fn selectLarkConfig(
+    cfg_opt: ?*const Config,
+    body: []const u8,
+) ?*const config_types.LarkConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.lark.len == 0) return null;
+
+    if (jsonStringField(body, "token")) |verification_token| {
+        if (findLarkConfigByVerificationToken(cfg, verification_token)) |lark_cfg| {
+            return lark_cfg;
+        }
+    }
+
+    return &cfg.channels.lark[0];
+}
+
 fn whatsappSessionKey(buf: []u8, body: []const u8) []const u8 {
     const sender = jsonStringField(body, "from") orelse "unknown";
     const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
@@ -582,6 +713,63 @@ fn whatsappReplyTarget(body: []const u8) []const u8 {
     // Cloud API delivery is addressed by recipient id ("from" for inbound DMs).
     // Group IDs are used for routing/session isolation, not outbound target.
     return jsonStringField(body, "from") orelse "unknown";
+}
+
+fn whatsappIsGroupMessage(body: []const u8) bool {
+    return jsonStringField(body, "group_jid") != null or
+        jsonStringField(body, "group_id") != null;
+}
+
+fn whatsappGroupId(body: []const u8) ?[]const u8 {
+    return jsonStringField(body, "group_jid") orelse
+        jsonStringField(body, "group_id");
+}
+
+fn whatsappSenderAllowed(
+    sender: ?[]const u8,
+    is_group: bool,
+    group_id: ?[]const u8,
+    allow_from: []const []const u8,
+    group_allow_from: []const []const u8,
+    groups: []const []const u8,
+    group_policy: []const u8,
+) bool {
+    const sender_id = sender orelse return false;
+
+    if (!is_group) {
+        if (allow_from.len == 0) return false;
+        return whatsappSenderInAllowlist(allow_from, sender_id);
+    }
+
+    if (std.mem.eql(u8, group_policy, "disabled")) return false;
+
+    const group_allowlist_enabled = std.mem.eql(u8, group_policy, "allowlist") or groups.len > 0;
+    if (group_allowlist_enabled) {
+        const gid = group_id orelse return false;
+        if (!channels.isAllowed(groups, gid)) return false;
+    }
+
+    if (std.mem.eql(u8, group_policy, "open")) return true;
+
+    const effective_allow = if (group_allow_from.len > 0) group_allow_from else allow_from;
+    if (effective_allow.len == 0) return false;
+    return whatsappSenderInAllowlist(effective_allow, sender_id);
+}
+
+fn whatsappSenderInAllowlist(allowlist: []const []const u8, sender_raw: []const u8) bool {
+    if (channels.isAllowed(allowlist, sender_raw)) return true;
+
+    var normalized_buf: [64]u8 = undefined;
+    const sender_normalized = channels.whatsapp.WhatsAppChannel.normalizePhone(&normalized_buf, sender_raw);
+    if (!std.mem.eql(u8, sender_normalized, sender_raw) and channels.isAllowed(allowlist, sender_normalized)) {
+        return true;
+    }
+    if (sender_normalized.len > 0 and sender_normalized[0] == '+' and
+        channels.isAllowed(allowlist, sender_normalized[1..]))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn whatsappSessionKeyRouted(
@@ -652,6 +840,35 @@ fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
         std.mem.eql(u8, type_val.string, "channel");
 }
 
+fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
+    if (allow_from.len == 0) return true;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return false;
+    if (msg_obj != .object) return false;
+
+    const from_obj = msg_obj.object.get("from") orelse return false;
+    if (from_obj != .object) return false;
+
+    if (from_obj.object.get("username")) |uname| {
+        if (uname == .string and channels.isAllowed(allow_from, uname.string)) return true;
+    }
+
+    if (from_obj.object.get("id")) |id_val| {
+        if (id_val == .integer) {
+            var id_buf: [32]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id_val.integer}) catch return false;
+            if (channels.isAllowed(allow_from, id_str)) return true;
+        }
+    }
+
+    return false;
+}
+
 fn telegramSessionKeyRouted(
     allocator: std.mem.Allocator,
     fallback_buf: []u8,
@@ -674,8 +891,63 @@ fn telegramSessionKeyRouted(
     );
 }
 
+fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return jsonIntField(body, "chat_id");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return jsonIntField(body, "chat_id");
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return jsonIntField(body, "chat_id");
+    if (msg_obj != .object) return jsonIntField(body, "chat_id");
+
+    const chat_obj = msg_obj.object.get("chat") orelse return jsonIntField(body, "chat_id");
+    if (chat_obj != .object) return jsonIntField(body, "chat_id");
+
+    const id_val = chat_obj.object.get("id") orelse return jsonIntField(body, "chat_id");
+    if (id_val != .integer) return jsonIntField(body, "chat_id");
+    return id_val.integer;
+}
+
+fn telegramSenderIdentity(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    id_buf: []u8,
+) []const u8 {
+    if (jsonStringField(body, "username")) |uname| return uname;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return "unknown";
+    defer parsed.deinit();
+    if (parsed.value != .object) return "unknown";
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return "unknown";
+    if (msg_obj != .object) return "unknown";
+
+    const from_obj = msg_obj.object.get("from") orelse return "unknown";
+    if (from_obj != .object) return "unknown";
+    if (from_obj.object.get("id")) |id_val| {
+        if (id_val == .integer) {
+            return std.fmt.bufPrint(id_buf, "{d}", .{id_val.integer}) catch "unknown";
+        }
+    }
+    return "unknown";
+}
+
 fn lineSessionKey(buf: []u8, evt: channels.line.LineEvent) []const u8 {
     return std.fmt.bufPrint(buf, "line:{s}", .{evt.user_id orelse "unknown"}) catch "line:unknown";
+}
+
+fn lineReplyTarget(evt: channels.line.LineEvent) []const u8 {
+    const source_type = evt.source_type orelse "";
+    if (std.mem.eql(u8, source_type, "group")) {
+        return evt.group_id orelse evt.user_id orelse "unknown";
+    }
+    if (std.mem.eql(u8, source_type, "room")) {
+        return evt.room_id orelse evt.user_id orelse "unknown";
+    }
+    return evt.user_id orelse "unknown";
 }
 
 fn lineSessionKeyRouted(
@@ -688,10 +960,11 @@ fn lineSessionKeyRouted(
     const fallback = lineSessionKey(fallback_buf, evt);
     const src_type = evt.source_type orelse "";
     const peer_kind: agent_routing.ChatType = if (std.mem.eql(u8, src_type, "group") or std.mem.eql(u8, src_type, "room")) .group else .direct;
+    var peer_buf: [160]u8 = undefined;
     const peer_id = if (std.mem.eql(u8, src_type, "group"))
-        evt.group_id orelse evt.user_id orelse "unknown"
+        std.fmt.bufPrint(&peer_buf, "group:{s}", .{evt.group_id orelse evt.user_id orelse "unknown"}) catch return fallback
     else if (std.mem.eql(u8, src_type, "room"))
-        evt.room_id orelse evt.user_id orelse "unknown"
+        std.fmt.bufPrint(&peer_buf, "room:{s}", .{evt.room_id orelse evt.user_id orelse "unknown"}) catch return fallback
     else
         evt.user_id orelse "unknown";
     return resolveRouteSessionKey(
@@ -861,20 +1134,23 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.telegram_allow_from = tg_cfg.allow_from;
             state.telegram_account_id = tg_cfg.account_id;
         }
-        if (cfg.channels.whatsapp) |wa_cfg| {
+        if (cfg.channels.whatsappPrimary()) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
             state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
             state.whatsapp_access_token = wa_cfg.access_token;
             state.whatsapp_allow_from = wa_cfg.allow_from;
+            state.whatsapp_group_allow_from = wa_cfg.group_allow_from;
+            state.whatsapp_groups = wa_cfg.groups;
+            state.whatsapp_group_policy = wa_cfg.group_policy;
             state.whatsapp_account_id = wa_cfg.account_id;
         }
-        if (cfg.channels.line) |line_cfg| {
+        if (cfg.channels.linePrimary()) |line_cfg| {
             state.line_channel_secret = line_cfg.channel_secret;
             state.line_access_token = line_cfg.access_token;
             state.line_allow_from = line_cfg.allow_from;
             state.line_account_id = line_cfg.account_id;
         }
-        if (cfg.channels.lark) |lark_cfg| {
+        if (cfg.channels.larkPrimary()) |lark_cfg| {
             state.lark_verification_token = lark_cfg.verification_token orelse "";
             state.lark_app_id = lark_cfg.app_id;
             state.lark_app_secret = lark_cfg.app_secret;
@@ -1120,54 +1396,56 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 } else {
                     const body = extractBody(raw);
                     if (body) |b| {
+                        var tg_bot_token = state.telegram_bot_token;
+                        var tg_allow_from = state.telegram_allow_from;
+                        var tg_account_id = state.telegram_account_id;
+                        if (selectTelegramConfig(config_opt, target)) |tg_cfg| {
+                            tg_bot_token = tg_cfg.bot_token;
+                            tg_allow_from = tg_cfg.allow_from;
+                            tg_account_id = tg_cfg.account_id;
+                        }
+
                         // Parse Telegram update: extract message text and chat_id
                         const msg_text = jsonStringField(b, "text");
-                        const chat_id = jsonIntField(b, "chat_id");
+                        const chat_id = telegramChatId(req_allocator, b);
 
-                        // Check allow_from for Telegram
-                        var tg_authorized = true;
-                        if (state.telegram_allow_from.len > 0) {
-                            const sender = jsonStringField(b, "username");
-                            if (sender) |s| {
-                                if (!channels.isAllowed(state.telegram_allow_from, s)) {
-                                    tg_authorized = false;
-                                }
-                            }
-                        }
+                        // Check allow_from for Telegram sender identities (username and numeric user id).
+                        const tg_authorized = telegramSenderAllowed(req_allocator, tg_allow_from, b);
 
                         if (!tg_authorized) {
                             response_body = "{\"status\":\"unauthorized\"}";
                         } else if (msg_text != null and chat_id != null) {
-                            const sender = jsonStringField(b, "username") orelse "unknown";
+                            var sender_buf: [32]u8 = undefined;
+                            const sender = telegramSenderIdentity(req_allocator, b, &sender_buf);
                             var cid_buf: [32]u8 = undefined;
                             const cid_str = std.fmt.bufPrint(&cid_buf, "{d}", .{chat_id.?}) catch "0";
 
                             if (state.event_bus) |eb| {
                                 // Bus mode: publish to event bus, let daemon dispatch
                                 var meta_buf: [256]u8 = undefined;
-                                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{state.telegram_account_id}) catch null;
+                                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{tg_account_id}) catch null;
                                 var kb: [64]u8 = undefined;
                                 const tg_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
-                                const sk = telegramSessionKeyRouted(req_allocator, &kb, chat_id.?, b, tg_cfg_opt, state.telegram_account_id);
+                                const sk = telegramSessionKeyRouted(req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                                 _ = publishToBus(eb, state.allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
                                 response_body = "{\"status\":\"ok\"}";
                             } else if (session_mgr_opt) |*sm| {
                                 // In-request mode (standalone gateway)
                                 var kb: [64]u8 = undefined;
                                 const tg_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
-                                const sk = telegramSessionKeyRouted(req_allocator, &kb, chat_id.?, b, tg_cfg_opt, state.telegram_account_id);
+                                const sk = telegramSessionKeyRouted(req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?) catch |err| blk: {
                                     if (err == error.ProviderDoesNotSupportVision) {
-                                        if (state.telegram_bot_token.len > 0) {
-                                            sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, "The current provider does not support image input.") catch {};
+                                        if (tg_bot_token.len > 0) {
+                                            sendTelegramReply(req_allocator, tg_bot_token, chat_id.?, "The current provider does not support image input.") catch {};
                                         }
                                     }
                                     break :blk null;
                                 };
                                 if (reply) |r| {
                                     defer allocator.free(r);
-                                    if (state.telegram_bot_token.len > 0) {
-                                        sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, r) catch {};
+                                    if (tg_bot_token.len > 0) {
+                                        sendTelegramReply(req_allocator, tg_bot_token, chat_id.?, r) catch {};
                                     }
                                     response_body = "{\"status\":\"ok\"}";
                                 } else {
@@ -1192,11 +1470,15 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     const mode = parseQueryParam(target, "hub.mode");
                     const token = parseQueryParam(target, "hub.verify_token");
                     const challenge = parseQueryParam(target, "hub.challenge");
+                    var wa_verify_token = state.whatsapp_verify_token;
+                    if (selectWhatsAppConfig(config_opt, null, token)) |wa_cfg| {
+                        wa_verify_token = wa_cfg.verify_token;
+                    }
 
                     if (mode != null and challenge != null and token != null and
                         std.mem.eql(u8, mode.?, "subscribe") and
-                        state.whatsapp_verify_token.len > 0 and
-                        std.mem.eql(u8, token.?, state.whatsapp_verify_token))
+                        wa_verify_token.len > 0 and
+                        std.mem.eql(u8, token.?, wa_verify_token))
                     {
                         response_body = challenge.?;
                     } else {
@@ -1208,56 +1490,83 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     if (!state.rate_limiter.allowWebhook(state.allocator, "whatsapp")) {
                         response_status = "429 Too Many Requests";
                         response_body = "{\"error\":\"rate limited\"}";
-                    } else if (state.whatsapp_app_secret.len > 0) sig_check: {
-                        // HMAC-SHA256 signature verification (when app_secret is configured)
-                        const sig_header = extractHeader(raw, "X-Hub-Signature-256") orelse {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"missing signature\"}";
-                            break :sig_check;
-                        };
-                        const body_for_sig = extractBody(raw) orelse "";
-                        if (!verifyWhatsappSignature(body_for_sig, sig_header, state.whatsapp_app_secret)) {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"invalid signature\"}";
-                            break :sig_check;
+                    } else {
+                        const wa_body = extractBody(raw);
+                        var wa_app_secret = state.whatsapp_app_secret;
+                        var wa_access_token = state.whatsapp_access_token;
+                        var wa_allow_from = state.whatsapp_allow_from;
+                        var wa_group_allow_from = state.whatsapp_group_allow_from;
+                        var wa_groups = state.whatsapp_groups;
+                        var wa_group_policy = state.whatsapp_group_policy;
+                        var wa_account_id = state.whatsapp_account_id;
+                        if (selectWhatsAppConfig(config_opt, wa_body, null)) |wa_cfg| {
+                            wa_app_secret = wa_cfg.app_secret orelse "";
+                            wa_access_token = wa_cfg.access_token;
+                            wa_allow_from = wa_cfg.allow_from;
+                            wa_group_allow_from = wa_cfg.group_allow_from;
+                            wa_groups = wa_cfg.groups;
+                            wa_group_policy = wa_cfg.group_policy;
+                            wa_account_id = wa_cfg.account_id;
                         }
-                        // Signature valid — proceed with message processing
-                        const body = if (body_for_sig.len > 0) body_for_sig else null;
-                        if (body) |b| {
-                            // Check allow_from for WhatsApp
-                            if (state.whatsapp_allow_from.len > 0) {
-                                const wa_sender = jsonStringField(b, "from");
-                                if (wa_sender) |s| {
-                                    if (!channels.isAllowed(state.whatsapp_allow_from, s)) {
-                                        response_body = "{\"status\":\"unauthorized\"}";
-                                        break :sig_check;
-                                    }
-                                }
-                            }
-                            const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
-                                channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(req_allocator, state.whatsapp_access_token, b);
-                            if (msg_text) |mt| {
-                                var wa_key_buf: [256]u8 = undefined;
-                                const wa_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
-                                const wa_session_key = whatsappSessionKeyRouted(req_allocator, &wa_key_buf, b, wa_cfg_opt, state.whatsapp_account_id);
-                                const wa_sender = jsonStringField(b, "from") orelse "unknown";
-                                const wa_chat_target = whatsappReplyTarget(b);
 
-                                if (state.event_bus) |eb| {
-                                    var meta_buf: [256]u8 = undefined;
-                                    const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{state.whatsapp_account_id}) catch null;
-                                    _ = publishToBus(eb, state.allocator, "whatsapp", wa_sender, wa_chat_target, mt, wa_session_key, meta);
-                                    response_body = "{\"status\":\"received\"}";
-                                } else if (session_mgr_opt) |*sm| {
-                                    const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
-                                        if (err == error.ProviderDoesNotSupportVision) {
-                                            response_body = "{\"error\":\"provider does not support image input\"}";
+                        if (wa_app_secret.len > 0) sig_check: {
+                            // HMAC-SHA256 signature verification (when app_secret is configured)
+                            const sig_header = extractHeader(raw, "X-Hub-Signature-256") orelse {
+                                response_status = "403 Forbidden";
+                                response_body = "{\"error\":\"missing signature\"}";
+                                break :sig_check;
+                            };
+                            const body_for_sig = wa_body orelse "";
+                            if (!verifyWhatsappSignature(body_for_sig, sig_header, wa_app_secret)) {
+                                response_status = "403 Forbidden";
+                                response_body = "{\"error\":\"invalid signature\"}";
+                                break :sig_check;
+                            }
+                            // Signature valid — proceed with message processing
+                            const body = if (body_for_sig.len > 0) body_for_sig else null;
+                            if (body) |b| {
+                                const wa_sender_raw = jsonStringField(b, "from");
+                                const wa_is_group = whatsappIsGroupMessage(b);
+                                const wa_group_id = whatsappGroupId(b);
+                                if (!whatsappSenderAllowed(
+                                    wa_sender_raw,
+                                    wa_is_group,
+                                    wa_group_id,
+                                    wa_allow_from,
+                                    wa_group_allow_from,
+                                    wa_groups,
+                                    wa_group_policy,
+                                )) {
+                                    response_body = "{\"status\":\"unauthorized\"}";
+                                    break :sig_check;
+                                }
+                                const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
+                                    channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(req_allocator, wa_access_token, b);
+                                if (msg_text) |mt| {
+                                    var wa_key_buf: [256]u8 = undefined;
+                                    const wa_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
+                                    const wa_session_key = whatsappSessionKeyRouted(req_allocator, &wa_key_buf, b, wa_cfg_opt, wa_account_id);
+                                    const wa_sender = jsonStringField(b, "from") orelse "unknown";
+                                    const wa_chat_target = whatsappReplyTarget(b);
+
+                                    if (state.event_bus) |eb| {
+                                        var meta_buf: [256]u8 = undefined;
+                                        const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{wa_account_id}) catch null;
+                                        _ = publishToBus(eb, state.allocator, "whatsapp", wa_sender, wa_chat_target, mt, wa_session_key, meta);
+                                        response_body = "{\"status\":\"received\"}";
+                                    } else if (session_mgr_opt) |*sm| {
+                                        const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
+                                            if (err == error.ProviderDoesNotSupportVision) {
+                                                response_body = "{\"error\":\"provider does not support image input\"}";
+                                            }
+                                            break :blk null;
+                                        };
+                                        if (reply) |r| {
+                                            defer allocator.free(r);
+                                            response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
+                                        } else {
+                                            response_body = "{\"status\":\"received\"}";
                                         }
-                                        break :blk null;
-                                    };
-                                    if (reply) |r| {
-                                        defer allocator.free(r);
-                                        response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
                                     } else {
                                         response_body = "{\"status\":\"received\"}";
                                     }
@@ -1267,47 +1576,52 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                             } else {
                                 response_body = "{\"status\":\"received\"}";
                             }
-                        } else {
-                            response_body = "{\"status\":\"received\"}";
-                        }
-                    } else wa_nosig: {
-                        const body = extractBody(raw);
-                        if (body) |b| {
-                            // Check allow_from for WhatsApp
-                            if (state.whatsapp_allow_from.len > 0) {
+                        } else wa_nosig: {
+                            const body = wa_body;
+                            if (body) |b| {
                                 const wa_sender = jsonStringField(b, "from");
-                                if (wa_sender) |s| {
-                                    if (!channels.isAllowed(state.whatsapp_allow_from, s)) {
-                                        response_body = "{\"status\":\"unauthorized\"}";
-                                        break :wa_nosig;
-                                    }
+                                const wa_is_group = whatsappIsGroupMessage(b);
+                                const wa_group_id = whatsappGroupId(b);
+                                if (!whatsappSenderAllowed(
+                                    wa_sender,
+                                    wa_is_group,
+                                    wa_group_id,
+                                    wa_allow_from,
+                                    wa_group_allow_from,
+                                    wa_groups,
+                                    wa_group_policy,
+                                )) {
+                                    response_body = "{\"status\":\"unauthorized\"}";
+                                    break :wa_nosig;
                                 }
-                            }
-                            // Try to extract message text from WhatsApp payload
-                            const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
-                                channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(req_allocator, state.whatsapp_access_token, b);
-                            if (msg_text) |mt| {
-                                var wa_key_buf: [256]u8 = undefined;
-                                const wa_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
-                                const wa_session_key = whatsappSessionKeyRouted(req_allocator, &wa_key_buf, b, wa_cfg_opt, state.whatsapp_account_id);
-                                const wa_sender_ns = jsonStringField(b, "from") orelse "unknown";
-                                const wa_chat_target_ns = whatsappReplyTarget(b);
+                                // Try to extract message text from WhatsApp payload
+                                const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
+                                    channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(req_allocator, wa_access_token, b);
+                                if (msg_text) |mt| {
+                                    var wa_key_buf: [256]u8 = undefined;
+                                    const wa_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
+                                    const wa_session_key = whatsappSessionKeyRouted(req_allocator, &wa_key_buf, b, wa_cfg_opt, wa_account_id);
+                                    const wa_sender_ns = jsonStringField(b, "from") orelse "unknown";
+                                    const wa_chat_target_ns = whatsappReplyTarget(b);
 
-                                if (state.event_bus) |eb| {
-                                    var meta_buf: [256]u8 = undefined;
-                                    const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{state.whatsapp_account_id}) catch null;
-                                    _ = publishToBus(eb, state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
-                                    response_body = "{\"status\":\"received\"}";
-                                } else if (session_mgr_opt) |*sm| {
-                                    const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
-                                        if (err == error.ProviderDoesNotSupportVision) {
-                                            response_body = "{\"error\":\"provider does not support image input\"}";
+                                    if (state.event_bus) |eb| {
+                                        var meta_buf: [256]u8 = undefined;
+                                        const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{wa_account_id}) catch null;
+                                        _ = publishToBus(eb, state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
+                                        response_body = "{\"status\":\"received\"}";
+                                    } else if (session_mgr_opt) |*sm| {
+                                        const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
+                                            if (err == error.ProviderDoesNotSupportVision) {
+                                                response_body = "{\"error\":\"provider does not support image input\"}";
+                                            }
+                                            break :blk null;
+                                        };
+                                        if (reply) |r| {
+                                            defer allocator.free(r);
+                                            response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
+                                        } else {
+                                            response_body = "{\"status\":\"received\"}";
                                         }
-                                        break :blk null;
-                                    };
-                                    if (reply) |r| {
-                                        defer allocator.free(r);
-                                        response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
                                     } else {
                                         response_body = "{\"status\":\"received\"}";
                                     }
@@ -1317,8 +1631,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                             } else {
                                 response_body = "{\"status\":\"received\"}";
                             }
-                        } else {
-                            response_body = "{\"status\":\"received\"}";
                         }
                     }
                 } else {
@@ -1334,51 +1646,80 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     response_status = "429 Too Many Requests";
                     response_body = "{\"error\":\"rate limited\"}";
                 } else line_handler: {
-                    // Verify LINE signature
-                    if (state.line_channel_secret.len > 0) {
-                        const sig_header = extractHeader(raw, "X-Line-Signature") orelse {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"missing signature\"}";
-                            break :line_handler;
-                        };
-                        const body_for_sig = extractBody(raw) orelse "";
-                        if (!channels.line.LineChannel.verifySignature(body_for_sig, sig_header, state.line_channel_secret)) {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"invalid signature\"}";
-                            break :line_handler;
-                        }
-                    }
                     const body = extractBody(raw);
                     if (body) |b| {
+                        var line_channel_secret = state.line_channel_secret;
+                        var line_access_token = state.line_access_token;
+                        var line_allow_from = state.line_allow_from;
+                        var line_account_id = state.line_account_id;
+
+                        const sig_header = extractHeader(raw, "X-Line-Signature");
+                        if (config_opt) |cfg| {
+                            const needs_signature = hasLineSecrets(cfg);
+                            if (needs_signature) {
+                                const sig = sig_header orelse {
+                                    response_status = "403 Forbidden";
+                                    response_body = "{\"error\":\"missing signature\"}";
+                                    break :line_handler;
+                                };
+                                const matched_line_cfg = selectLineConfigBySignature(config_opt, b, sig) orelse {
+                                    response_status = "403 Forbidden";
+                                    response_body = "{\"error\":\"invalid signature\"}";
+                                    break :line_handler;
+                                };
+                                line_channel_secret = matched_line_cfg.channel_secret;
+                                line_access_token = matched_line_cfg.access_token;
+                                line_allow_from = matched_line_cfg.allow_from;
+                                line_account_id = matched_line_cfg.account_id;
+                            } else if (cfg.channels.linePrimary()) |line_cfg| {
+                                line_channel_secret = line_cfg.channel_secret;
+                                line_access_token = line_cfg.access_token;
+                                line_allow_from = line_cfg.allow_from;
+                                line_account_id = line_cfg.account_id;
+                            }
+                        } else if (line_channel_secret.len > 0) {
+                            const sig = sig_header orelse {
+                                response_status = "403 Forbidden";
+                                response_body = "{\"error\":\"missing signature\"}";
+                                break :line_handler;
+                            };
+                            if (!channels.line.LineChannel.verifySignature(b, sig, line_channel_secret)) {
+                                response_status = "403 Forbidden";
+                                response_body = "{\"error\":\"invalid signature\"}";
+                                break :line_handler;
+                            }
+                        }
+
                         const events = channels.line.LineChannel.parseWebhookEvents(req_allocator, b) catch {
                             response_body = "{\"status\":\"parse_error\"}";
                             break :line_handler;
                         };
                         for (events) |evt| {
                             // Check allow_from
-                            if (state.line_allow_from.len > 0) {
+                            if (line_allow_from.len > 0) {
                                 if (evt.user_id) |uid| {
-                                    if (!channels.isAllowed(state.line_allow_from, uid)) continue;
+                                    if (!channels.isAllowed(line_allow_from, uid)) continue;
                                 } else continue;
                             }
                             if (evt.message_text) |text| {
                                 var kb: [128]u8 = undefined;
                                 const line_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
-                                const sk = lineSessionKeyRouted(req_allocator, &kb, evt, line_cfg_opt, state.line_account_id);
+                                const sk = lineSessionKeyRouted(req_allocator, &kb, evt, line_cfg_opt, line_account_id);
                                 const uid = evt.user_id orelse "unknown";
+                                const line_target = lineReplyTarget(evt);
 
                                 if (state.event_bus) |eb| {
                                     var meta_buf: [256]u8 = undefined;
-                                    const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{state.line_account_id}) catch null;
-                                    _ = publishToBus(eb, state.allocator, "line", uid, uid, text, sk, meta);
+                                    const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{line_account_id}) catch null;
+                                    _ = publishToBus(eb, state.allocator, "line", uid, line_target, text, sk, meta);
                                 } else if (session_mgr_opt) |*sm| {
                                     const reply: ?[]const u8 = sm.processMessage(sk, text) catch null;
                                     if (reply) |r| {
                                         defer allocator.free(r);
                                         if (evt.reply_token) |rt| {
                                             var line_ch = channels.line.LineChannel.init(req_allocator, .{
-                                                .access_token = state.line_access_token,
-                                                .channel_secret = state.line_channel_secret,
+                                                .access_token = line_access_token,
+                                                .channel_secret = line_channel_secret,
                                             });
                                             line_ch.replyMessage(rt, r) catch {};
                                         }
@@ -1404,6 +1745,19 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         response_body = "{\"status\":\"received\"}";
                         break :lark_handler;
                     };
+                    var lark_verification_token = state.lark_verification_token;
+                    var lark_app_id = state.lark_app_id;
+                    var lark_app_secret = state.lark_app_secret;
+                    var lark_allow_from = state.lark_allow_from;
+                    var lark_account_id = state.lark_account_id;
+                    if (selectLarkConfig(config_opt, body)) |lark_cfg| {
+                        lark_verification_token = lark_cfg.verification_token orelse "";
+                        lark_app_id = lark_cfg.app_id;
+                        lark_app_secret = lark_cfg.app_secret;
+                        lark_allow_from = lark_cfg.allow_from;
+                        lark_account_id = lark_cfg.account_id;
+                    }
+
                     // Check for URL verification challenge
                     if (std.mem.indexOf(u8, body, "\"url_verification\"") != null) {
                         // Lark URL verification: respond with the challenge
@@ -1417,7 +1771,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         break :lark_handler;
                     }
                     // Verify token if configured
-                    if (state.lark_verification_token.len > 0) {
+                    if (lark_verification_token.len > 0) {
                         // Extract token from header.token in the payload
                         const payload_token = blk: {
                             const parsed = std.json.parseFromSlice(std.json.Value, req_allocator, body, .{}) catch break :blk @as(?[]const u8, null);
@@ -1429,7 +1783,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                             break :blk if (token_val == .string) req_allocator.dupe(u8, token_val.string) catch null else null;
                         };
                         if (payload_token) |pt| {
-                            if (!std.mem.eql(u8, pt, state.lark_verification_token)) {
+                            if (!std.mem.eql(u8, pt, lark_verification_token)) {
                                 response_status = "403 Forbidden";
                                 response_body = "{\"error\":\"invalid verification token\"}";
                                 break :lark_handler;
@@ -1439,11 +1793,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     // Parse event using LarkChannel
                     var lark_ch = channels.lark.LarkChannel.init(
                         req_allocator,
-                        state.lark_app_id,
-                        state.lark_app_secret,
-                        state.lark_verification_token,
+                        lark_app_id,
+                        lark_app_secret,
+                        lark_verification_token,
                         0,
-                        state.lark_allow_from,
+                        lark_allow_from,
                     );
                     const messages = lark_ch.parseEventPayload(req_allocator, body) catch {
                         response_body = "{\"status\":\"parse_error\"}";
@@ -1452,11 +1806,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     for (messages) |msg| {
                         var kb: [128]u8 = undefined;
                         const lark_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
-                        const sk = larkSessionKeyRouted(req_allocator, &kb, msg, lark_cfg_opt, state.lark_account_id);
+                        const sk = larkSessionKeyRouted(req_allocator, &kb, msg, lark_cfg_opt, lark_account_id);
 
                         if (state.event_bus) |eb| {
                             var meta_buf: [256]u8 = undefined;
-                            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{state.lark_account_id}) catch null;
+                            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{lark_account_id}) catch null;
                             _ = publishToBus(eb, state.allocator, "lark", msg.sender, msg.sender, msg.content, sk, meta);
                         } else if (session_mgr_opt) |*sm| {
                             const reply: ?[]const u8 = sm.processMessage(sk, msg.content) catch null;
@@ -1860,6 +2214,179 @@ test "jsonIntField returns null for string value" {
     try std.testing.expect(jsonIntField(json, "chat_id") == null);
 }
 
+test "selectWhatsAppConfig picks account by phone_number_id" {
+    const wa_accounts = [_]config_types.WhatsAppConfig{
+        .{
+            .account_id = "main",
+            .access_token = "tok-a",
+            .phone_number_id = "111",
+            .verify_token = "verify-a",
+        },
+        .{
+            .account_id = "backup",
+            .access_token = "tok-b",
+            .phone_number_id = "222",
+            .verify_token = "verify-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .whatsapp = &wa_accounts,
+        },
+    };
+    const body = "{\"entry\":[{\"changes\":[{\"value\":{\"metadata\":{\"phone_number_id\":\"222\"}}}]}]}";
+    const selected = selectWhatsAppConfig(&cfg, body, null);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectTelegramConfig picks account by query account_id" {
+    const tg_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "token-main",
+            .allow_from = &.{"main-user"},
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "token-backup",
+            .allow_from = &.{"backup-user"},
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &tg_accounts,
+        },
+    };
+
+    const selected = selectTelegramConfig(&cfg, "/telegram?account_id=backup");
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectTelegramConfig falls back to preferred primary account" {
+    const tg_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "z-last",
+            .bot_token = "token-z",
+        },
+        .{
+            .account_id = "default",
+            .bot_token = "token-default",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &tg_accounts,
+        },
+    };
+
+    const selected = selectTelegramConfig(&cfg, "/telegram");
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("default", selected.?.account_id);
+}
+
+test "selectWhatsAppConfig picks account by verify_token" {
+    const wa_accounts = [_]config_types.WhatsAppConfig{
+        .{
+            .account_id = "main",
+            .access_token = "tok-a",
+            .phone_number_id = "111",
+            .verify_token = "verify-a",
+        },
+        .{
+            .account_id = "backup",
+            .access_token = "tok-b",
+            .phone_number_id = "222",
+            .verify_token = "verify-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .whatsapp = &wa_accounts,
+        },
+    };
+    const selected = selectWhatsAppConfig(&cfg, null, "verify-b");
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectLineConfigBySignature matches account and rejects bad signature" {
+    const body = "{\"events\":[]}";
+    const line_accounts = [_]config_types.LineConfig{
+        .{
+            .account_id = "main",
+            .access_token = "line-a",
+            .channel_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .access_token = "line-b",
+            .channel_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .line = &line_accounts,
+        },
+    };
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, "secret-b");
+    var sig_buf: [44]u8 = undefined;
+    const signature = std.base64.standard.Encoder.encode(&sig_buf, &mac);
+
+    const selected = selectLineConfigBySignature(&cfg, body, signature);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+    try std.testing.expect(selectLineConfigBySignature(&cfg, body, "invalid-signature") == null);
+}
+
+test "selectLarkConfig picks account by verification token" {
+    const lark_accounts = [_]config_types.LarkConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-a",
+            .app_secret = "secret-a",
+            .verification_token = "token-a",
+        },
+        .{
+            .account_id = "backup",
+            .app_id = "app-b",
+            .app_secret = "secret-b",
+            .verification_token = "token-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .lark = &lark_accounts,
+        },
+    };
+    const body = "{\"header\":{\"token\":\"token-b\"}}";
+    const selected = selectLarkConfig(&cfg, body);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
 test "whatsappSessionKey builds direct key by sender" {
     const body = "{\"from\":\"15550001111\",\"text\":{\"body\":\"hi\"}}";
     var key_buf: [256]u8 = undefined;
@@ -1872,6 +2399,108 @@ test "whatsappSessionKey builds group key when group id exists" {
     var key_buf: [256]u8 = undefined;
     const key = whatsappSessionKey(&key_buf, body);
     try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
+}
+
+test "telegramSenderAllowed permits when allow_from is empty" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"from":{"id":12345,"username":"alice"}}}
+    ;
+    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
+}
+
+test "telegramChatId extracts nested message.chat.id" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":-100777},"from":{"id":12345},"text":"hi"}}
+    ;
+    try std.testing.expectEqual(@as(i64, -100777), telegramChatId(allocator, body).?);
+}
+
+test "telegramChatId falls back to flat chat_id for backward compatibility" {
+    const allocator = std.testing.allocator;
+    const body = "{\"chat_id\":12345,\"text\":\"hi\"}";
+    try std.testing.expectEqual(@as(i64, 12345), telegramChatId(allocator, body).?);
+}
+
+test "telegramSenderAllowed matches numeric sender id from nested from object" {
+    const allocator = std.testing.allocator;
+    const allow_from = [_][]const u8{"12345"};
+    const body =
+        \\{"message":{"from":{"id":12345},"chat":{"id":-100777}}}
+    ;
+    try std.testing.expect(telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramSenderAllowed does not confuse chat id with sender id" {
+    const allocator = std.testing.allocator;
+    const allow_from = [_][]const u8{"-100777"};
+    const body =
+        \\{"message":{"from":{"id":12345},"chat":{"id":-100777}}}
+    ;
+    try std.testing.expect(!telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramSenderAllowed rejects sender outside allowlist" {
+    const allocator = std.testing.allocator;
+    const allow_from = [_][]const u8{"alice"};
+    const body =
+        \\{"message":{"from":{"id":12345}}}
+    ;
+    try std.testing.expect(!telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramSenderIdentity falls back to numeric id when username is missing" {
+    const allocator = std.testing.allocator;
+    var sender_buf: [32]u8 = undefined;
+    const body =
+        \\{"message":{"from":{"id":12345},"chat":{"id":-100777}}}
+    ;
+    try std.testing.expectEqualStrings("12345", telegramSenderIdentity(allocator, body, &sender_buf));
+}
+
+test "whatsappSenderAllowed direct respects allow_from" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    try std.testing.expect(whatsappSenderAllowed("+1111111111", false, null, &allow_from, &.{}, &.{}, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+2222222222", false, null, &allow_from, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSenderAllowed direct denies all when allow_from is empty" {
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", false, null, &.{}, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSenderAllowed group open bypasses allow_from" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    try std.testing.expect(whatsappSenderAllowed("+2222222222", true, "1203630@g.us", &allow_from, &.{}, &.{}, "open"));
+}
+
+test "whatsappSenderAllowed open policy still respects explicit groups allowlist" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    const groups = [_][]const u8{"1203630@g.us"};
+    try std.testing.expect(whatsappSenderAllowed("+2222222222", true, "1203630@g.us", &allow_from, &.{}, &groups, "open"));
+    try std.testing.expect(!whatsappSenderAllowed("+2222222222", true, "1203631@g.us", &allow_from, &.{}, &groups, "open"));
+}
+
+test "whatsappSenderAllowed group allowlist uses groups and sender allowlists" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    const group_allow = [_][]const u8{"+3333333333"};
+    const groups = [_][]const u8{"1203630@g.us"};
+
+    try std.testing.expect(whatsappSenderAllowed("+3333333333", true, "1203630@g.us", &allow_from, &group_allow, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", true, "1203630@g.us", &allow_from, &group_allow, &groups, "allowlist"));
+
+    try std.testing.expect(whatsappSenderAllowed("+1111111111", true, "1203630@g.us", &allow_from, &.{}, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", true, "1203631@g.us", &allow_from, &.{}, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+9999999999", true, "1203630@g.us", &.{}, &.{}, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", true, "1203630@g.us", &allow_from, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSenderAllowed matches with and without plus prefix" {
+    const allow_with_plus = [_][]const u8{"+15550001111"};
+    const allow_without_plus = [_][]const u8{"15550001111"};
+
+    try std.testing.expect(whatsappSenderAllowed("15550001111", false, null, &allow_with_plus, &.{}, &.{}, "allowlist"));
+    try std.testing.expect(whatsappSenderAllowed("+15550001111", false, null, &allow_without_plus, &.{}, &.{}, "allowlist"));
 }
 
 test "whatsappSessionKeyRouted falls back without config" {
@@ -2054,14 +2683,14 @@ test "lineSessionKeyRouted uses group id for group events" {
                 .match = .{
                     .channel = "line",
                     .account_id = "line-main",
-                    .peer = .{ .kind = .group, .id = "G222" },
+                    .peer = .{ .kind = .group, .id = "group:G222" },
                 },
             },
         },
     };
 
     const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
-    try std.testing.expectEqualStrings("agent:line-group-agent:line:group:G222", key);
+    try std.testing.expectEqualStrings("agent:line-group-agent:line:group:group:G222", key);
 }
 
 test "lineSessionKeyRouted falls back to user session key without config" {
@@ -2074,6 +2703,68 @@ test "lineSessionKeyRouted falls back to user session key without config" {
 
     const key = lineSessionKeyRouted(allocator, &key_buf, evt, null, "default");
     try std.testing.expectEqualStrings("line:U777", key);
+}
+
+test "lineSessionKeyRouted uses room-prefixed peer id for room events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .room_id = "R333",
+        .source_type = "room",
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "line-room-agent",
+                .match = .{
+                    .channel = "line",
+                    .account_id = "line-main",
+                    .peer = .{ .kind = .group, .id = "room:R333" },
+                },
+            },
+        },
+    };
+
+    const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
+    try std.testing.expectEqualStrings("agent:line-room-agent:line:group:room:R333", key);
+}
+
+test "lineReplyTarget resolves conversation target for group events" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .group_id = "G222",
+        .source_type = "group",
+    };
+    try std.testing.expectEqualStrings("G222", lineReplyTarget(evt));
+}
+
+test "lineReplyTarget resolves conversation target for room events" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .room_id = "R333",
+        .source_type = "room",
+    };
+    try std.testing.expectEqualStrings("R333", lineReplyTarget(evt));
+}
+
+test "lineReplyTarget falls back to user for direct events" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .source_type = "user",
+    };
+    try std.testing.expectEqualStrings("U111", lineReplyTarget(evt));
 }
 
 test "larkSessionKeyRouted uses route engine when config exists" {

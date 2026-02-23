@@ -170,7 +170,7 @@ pub const SlackConfig = struct {
     app_token: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
-    dm_policy: []const u8 = "allow",
+    dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "mention_only",
 };
 
@@ -180,9 +180,11 @@ pub const WebhookConfig = struct {
 };
 
 pub const IMessageConfig = struct {
+    account_id: []const u8 = "default",
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
     group_policy: []const u8 = "allowlist",
+    db_path: ?[]const u8 = null,
     enabled: bool = false,
 };
 
@@ -191,7 +193,23 @@ pub const MatrixConfig = struct {
     homeserver: []const u8,
     access_token: []const u8,
     room_id: []const u8,
+    user_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+};
+
+pub const MattermostConfig = struct {
+    account_id: []const u8 = "default",
+    bot_token: []const u8,
+    base_url: []const u8,
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allowlist",
+    group_policy: []const u8 = "allowlist",
+    chatmode: []const u8 = "oncall",
+    onchar_prefixes: []const []const u8 = &.{ ">", "!" },
+    require_mention: bool = true,
 };
 
 pub const WhatsAppConfig = struct {
@@ -202,6 +220,7 @@ pub const WhatsAppConfig = struct {
     app_secret: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
+    groups: []const []const u8 = &.{},
     group_policy: []const u8 = "allowlist",
 };
 
@@ -316,47 +335,82 @@ pub const ChannelsConfig = struct {
     discord: []const DiscordConfig = &.{},
     slack: []const SlackConfig = &.{},
     webhook: ?WebhookConfig = null,
-    imessage: ?IMessageConfig = null,
-    matrix: ?MatrixConfig = null,
-    whatsapp: ?WhatsAppConfig = null,
-    irc: ?IrcConfig = null,
-    lark: ?LarkConfig = null,
-    dingtalk: ?DingTalkConfig = null,
+    imessage: []const IMessageConfig = &.{},
+    matrix: []const MatrixConfig = &.{},
+    mattermost: []const MattermostConfig = &.{},
+    whatsapp: []const WhatsAppConfig = &.{},
+    irc: []const IrcConfig = &.{},
+    lark: []const LarkConfig = &.{},
+    dingtalk: []const DingTalkConfig = &.{},
     signal: []const SignalConfig = &.{},
-    email: ?EmailConfig = null,
-    line: ?LineConfig = null,
+    email: []const EmailConfig = &.{},
+    line: []const LineConfig = &.{},
     qq: []const QQConfig = &.{},
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
 
-    /// Get primary (first) account for a channel, or null if none configured.
+    fn primaryAccount(comptime T: type, items: []const T) ?T {
+        if (items.len == 0) return null;
+        if (comptime @hasField(T, "account_id")) {
+            for (items) |item| {
+                if (std.mem.eql(u8, item.account_id, "default")) return item;
+            }
+            for (items) |item| {
+                if (std.mem.eql(u8, item.account_id, "main")) return item;
+            }
+        }
+        return items[0];
+    }
+
+    /// Get preferred account for a channel, or null if none configured.
+    /// Selection order: `account_id=default`, then `account_id=main`, then first entry.
     pub fn telegramPrimary(self: *const ChannelsConfig) ?TelegramConfig {
-        if (self.telegram.len > 0) return self.telegram[0];
-        return null;
+        return primaryAccount(TelegramConfig, self.telegram);
     }
     pub fn discordPrimary(self: *const ChannelsConfig) ?DiscordConfig {
-        if (self.discord.len > 0) return self.discord[0];
-        return null;
+        return primaryAccount(DiscordConfig, self.discord);
     }
     pub fn slackPrimary(self: *const ChannelsConfig) ?SlackConfig {
-        if (self.slack.len > 0) return self.slack[0];
-        return null;
+        return primaryAccount(SlackConfig, self.slack);
     }
     pub fn signalPrimary(self: *const ChannelsConfig) ?SignalConfig {
-        if (self.signal.len > 0) return self.signal[0];
-        return null;
+        return primaryAccount(SignalConfig, self.signal);
+    }
+    pub fn imessagePrimary(self: *const ChannelsConfig) ?IMessageConfig {
+        return primaryAccount(IMessageConfig, self.imessage);
+    }
+    pub fn matrixPrimary(self: *const ChannelsConfig) ?MatrixConfig {
+        return primaryAccount(MatrixConfig, self.matrix);
+    }
+    pub fn mattermostPrimary(self: *const ChannelsConfig) ?MattermostConfig {
+        return primaryAccount(MattermostConfig, self.mattermost);
+    }
+    pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
+        return primaryAccount(WhatsAppConfig, self.whatsapp);
+    }
+    pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
+        return primaryAccount(IrcConfig, self.irc);
+    }
+    pub fn larkPrimary(self: *const ChannelsConfig) ?LarkConfig {
+        return primaryAccount(LarkConfig, self.lark);
+    }
+    pub fn dingtalkPrimary(self: *const ChannelsConfig) ?DingTalkConfig {
+        return primaryAccount(DingTalkConfig, self.dingtalk);
+    }
+    pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
+        return primaryAccount(EmailConfig, self.email);
+    }
+    pub fn linePrimary(self: *const ChannelsConfig) ?LineConfig {
+        return primaryAccount(LineConfig, self.line);
     }
     pub fn qqPrimary(self: *const ChannelsConfig) ?QQConfig {
-        if (self.qq.len > 0) return self.qq[0];
-        return null;
+        return primaryAccount(QQConfig, self.qq);
     }
     pub fn onebotPrimary(self: *const ChannelsConfig) ?OneBotConfig {
-        if (self.onebot.len > 0) return self.onebot[0];
-        return null;
+        return primaryAccount(OneBotConfig, self.onebot);
     }
     pub fn maixcamPrimary(self: *const ChannelsConfig) ?MaixCamConfig {
-        if (self.maixcam.len > 0) return self.maixcam[0];
-        return null;
+        return primaryAccount(MaixCamConfig, self.maixcam);
     }
 };
 
