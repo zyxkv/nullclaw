@@ -101,6 +101,11 @@ nullclaw doctor
 # Check channel health
 nullclaw channel doctor
 
+# Start specific channels
+nullclaw channel start telegram
+nullclaw channel start discord
+nullclaw channel start signal
+
 # Manage background service
 nullclaw service install
 nullclaw service status
