@@ -121,6 +121,8 @@ pub const Agent = struct {
         mem: ?Memory,
         observer_i: Observer,
     ) !Agent {
+        const default_model = cfg.default_model orelse return error.NoDefaultModel;
+
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
         for (tools, 0..) |t, i| {
@@ -138,9 +140,9 @@ pub const Agent = struct {
             .tool_specs = specs,
             .mem = mem,
             .observer = observer_i,
-            .model_name = cfg.default_model orelse "anthropic/claude-sonnet-4",
+            .model_name = default_model,
             .default_provider = cfg.default_provider,
-            .default_model = cfg.default_model orelse "anthropic/claude-sonnet-4",
+            .default_model = default_model,
             .configured_providers = cfg.providers,
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
@@ -1854,6 +1856,7 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc_test",
         .config_path = "/tmp/yc_test/config.json",
+        .default_model = "test/mock-model",
         .allocator = allocator,
     };
 

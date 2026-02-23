@@ -112,6 +112,27 @@ fn printVersion() void {
     bw.interface.flush() catch return;
 }
 
+const GatewayDaemonOverrideError = error{InvalidPort};
+
+fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
+    var port: u16 = cfg.gateway.port;
+    var host: []const u8 = cfg.gateway.host;
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        if ((std.mem.eql(u8, sub_args[i], "--port") or std.mem.eql(u8, sub_args[i], "-p")) and i + 1 < sub_args.len) {
+            i += 1;
+            port = std.fmt.parseInt(u16, sub_args[i], 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
+            i += 1;
+            host = sub_args[i];
+        }
+    }
+
+    cfg.gateway.port = port;
+    cfg.gateway.host = host;
+}
+
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -121,25 +142,17 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
-    // Config values are the baseline; CLI flags override them.
-    var port: u16 = cfg.gateway.port;
-    var host: []const u8 = cfg.gateway.host;
+    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
+        std.debug.print("Invalid port in CLI args.\n", .{});
+        std.process.exit(1);
+    };
 
-    var i: usize = 0;
-    while (i < sub_args.len) : (i += 1) {
-        if ((std.mem.eql(u8, sub_args[i], "--port") or std.mem.eql(u8, sub_args[i], "-p")) and i + 1 < sub_args.len) {
-            i += 1;
-            port = std.fmt.parseInt(u16, sub_args[i], 10) catch {
-                std.debug.print("Invalid port: {s}\n", .{sub_args[i]});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
-            i += 1;
-            host = sub_args[i];
-        }
-    }
+    cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
 
-    try yc.gateway.run(allocator, host, port, &cfg, null);
+    try yc.gateway.run(allocator, cfg.gateway.host, cfg.gateway.port, &cfg, null);
 }
 
 // ── Daemon ───────────────────────────────────────────────────────
@@ -151,25 +164,17 @@ fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     };
     defer cfg.deinit();
 
-    // Config values are the baseline; CLI flags override them.
-    var port: u16 = cfg.gateway.port;
-    var host: []const u8 = cfg.gateway.host;
+    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
+        std.debug.print("Invalid port in CLI args.\n", .{});
+        std.process.exit(1);
+    };
 
-    var i: usize = 0;
-    while (i < sub_args.len) : (i += 1) {
-        if ((std.mem.eql(u8, sub_args[i], "--port") or std.mem.eql(u8, sub_args[i], "-p")) and i + 1 < sub_args.len) {
-            i += 1;
-            port = std.fmt.parseInt(u16, sub_args[i], 10) catch {
-                std.debug.print("Invalid port: {s}\n", .{sub_args[i]});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
-            i += 1;
-            host = sub_args[i];
-        }
-    }
+    cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
 
-    try yc.daemon.run(allocator, &cfg, host, port);
+    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
 
 // ── Service ──────────────────────────────────────────────────────
@@ -736,6 +741,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     };
     defer config.deinit();
 
+    config.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
+
     // Check which channels are configured
     var has_any = false;
     for (yc.channel_catalog.known_channels) |meta| {
@@ -878,12 +888,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         std.process.exit(1);
     }
 
-    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
     const temperature = config.default_temperature;
 
     std.debug.print("nullclaw Signal bot starting...\n", .{});
-    std.debug.print("  Provider: {s}\n", .{config.default_provider});
-    std.debug.print("  Model: {s}\n", .{model});
+    config.printModelConfig();
     std.debug.print("  Temperature: {d:.1}\n", .{temperature});
     std.debug.print("  Signal URL: {s}\n", .{signal_config.http_url});
     std.debug.print("  Account: {s}\n", .{signal_config.account});
@@ -1177,7 +1185,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         std.process.exit(1);
     }
 
-    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
+    const model = config.default_model.?;
     const temperature = config.default_temperature;
 
     std.debug.print("nullclaw telegram bot starting...\n", .{});
@@ -1672,7 +1680,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"default_provider\": \"openai-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -1726,7 +1734,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"default_provider\": \"openai-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
 }
 
 fn printUsage() void {
@@ -1787,4 +1795,43 @@ test "parse known commands" {
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "applyGatewayDaemonOverrides applies CLI port before validation" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    cfg.gateway.port = 0;
+
+    const args = [_][]const u8{ "--port", "8080" };
+    try applyGatewayDaemonOverrides(&cfg, &args);
+
+    try std.testing.expectEqual(@as(u16, 8080), cfg.gateway.port);
+    try cfg.validate();
+}
+
+test "applyGatewayDaemonOverrides applies host override" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    const args = [_][]const u8{ "--host", "0.0.0.0" };
+    try applyGatewayDaemonOverrides(&cfg, &args);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
+}
+
+test "applyGatewayDaemonOverrides rejects invalid port" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    const args = [_][]const u8{ "--port", "bad" };
+    try std.testing.expectError(error.InvalidPort, applyGatewayDaemonOverrides(&cfg, &args));
 }
