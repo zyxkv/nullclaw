@@ -1662,3 +1662,258 @@ test "unknown openclaw fields silently ignored" {
     // Should not crash — unknown fields are silently ignored
     try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Parity tests: multi-account config, account list helpers, session config
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "multi-account: empty accounts object returns empty slice" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.telegram.len);
+}
+
+test "multi-account: missing accounts key returns empty slice" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.telegram.len);
+}
+
+test "multi-account: missing channel config returns empty slice" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.telegram.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.discord.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.slack.len);
+}
+
+test "multi-account: sorted alphabetically across channels" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"discord": {"accounts": {"z-server": {"token": "zt"}, "a-server": {"token": "at"}, "m-server": {"token": "mt"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 3), cfg.channels.discord.len);
+    try std.testing.expectEqualStrings("a-server", cfg.channels.discord[0].account_id);
+    try std.testing.expectEqualStrings("m-server", cfg.channels.discord[1].account_id);
+    try std.testing.expectEqualStrings("z-server", cfg.channels.discord[2].account_id);
+    for (cfg.channels.discord) |acc| {
+        allocator.free(acc.account_id);
+        allocator.free(acc.token);
+    }
+    allocator.free(cfg.channels.discord);
+}
+
+test "multi-account: telegram primary returns first account" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"alpha": {"bot_token": "a-tok"}, "beta": {"bot_token": "b-tok"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    const primary = cfg.channels.telegramPrimary();
+    try std.testing.expect(primary != null);
+    try std.testing.expectEqualStrings("alpha", primary.?.account_id);
+    for (cfg.channels.telegram) |acc| {
+        allocator.free(acc.account_id);
+        allocator.free(acc.bot_token);
+    }
+    allocator.free(cfg.channels.telegram);
+}
+
+test "multi-account: primary returns null for empty slice" {
+    const cfg_ch = config_types.ChannelsConfig{};
+    try std.testing.expect(cfg_ch.telegramPrimary() == null);
+    try std.testing.expect(cfg_ch.discordPrimary() == null);
+    try std.testing.expect(cfg_ch.slackPrimary() == null);
+    try std.testing.expect(cfg_ch.signalPrimary() == null);
+}
+
+test "multi-account: account config overrides base fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"work": {"bot_token": "work-tok", "reply_in_private": true}, "personal": {"bot_token": "pers-tok"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.telegram.len);
+    // personal < work alphabetically
+    try std.testing.expectEqualStrings("personal", cfg.channels.telegram[0].account_id);
+    try std.testing.expectEqualStrings("pers-tok", cfg.channels.telegram[0].bot_token);
+    try std.testing.expect(cfg.channels.telegram[0].reply_in_private); // default is true
+    try std.testing.expectEqualStrings("work", cfg.channels.telegram[1].account_id);
+    try std.testing.expectEqualStrings("work-tok", cfg.channels.telegram[1].bot_token);
+    try std.testing.expect(cfg.channels.telegram[1].reply_in_private);
+    for (cfg.channels.telegram) |acc| {
+        allocator.free(acc.account_id);
+        allocator.free(acc.bot_token);
+    }
+    allocator.free(cfg.channels.telegram);
+}
+
+test "multi-account: multiple channels configured simultaneously" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "tg-tok"}}}, "discord": {"accounts": {"main": {"token": "dc-tok"}}}, "slack": {"accounts": {"main": {"bot_token": "sl-tok"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.telegram.len > 0);
+    try std.testing.expect(cfg.channels.discord.len > 0);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expectEqualStrings("tg-tok", cfg.channels.telegram[0].bot_token);
+    try std.testing.expectEqualStrings("dc-tok", cfg.channels.discord[0].token);
+    try std.testing.expectEqualStrings("sl-tok", cfg.channels.slack[0].bot_token);
+    for (cfg.channels.telegram) |acc| {
+        allocator.free(acc.account_id);
+        allocator.free(acc.bot_token);
+    }
+    allocator.free(cfg.channels.telegram);
+    for (cfg.channels.discord) |acc| {
+        allocator.free(acc.account_id);
+        allocator.free(acc.token);
+    }
+    allocator.free(cfg.channels.discord);
+    for (cfg.channels.slack) |acc| {
+        allocator.free(acc.account_id);
+        allocator.free(acc.bot_token);
+    }
+    allocator.free(cfg.channels.slack);
+}
+
+test "session config: parse dm_scope with dash format" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"dmScope": "per-peer"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.DmScope.per_peer, cfg.session.dm_scope);
+}
+
+test "session config: parse dm_scope with underscore format" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"dm_scope": "per_peer"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.DmScope.per_peer, cfg.session.dm_scope);
+}
+
+test "session config: parse per-account-channel-peer scope" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"dmScope": "per-account-channel-peer"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.DmScope.per_account_channel_peer, cfg.session.dm_scope);
+}
+
+test "session config: default dm_scope is per_channel_peer" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
+}
+
+test "session config: parse idle_minutes" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"idle_minutes": 30}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 30), cfg.session.idle_minutes);
+}
+
+test "session config: parse idleMinutes camelCase" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"idleMinutes": 45}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 45), cfg.session.idle_minutes);
+}
+
+test "session config: parse identity_links map format" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"identityLinks": {"alice": ["telegram:111", "discord:222"]}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.session.identity_links.len);
+    try std.testing.expectEqualStrings("alice", cfg.session.identity_links[0].canonical);
+    try std.testing.expectEqual(@as(usize, 2), cfg.session.identity_links[0].peers.len);
+    allocator.free(cfg.session.identity_links[0].canonical);
+    for (cfg.session.identity_links[0].peers) |p| allocator.free(p);
+    allocator.free(cfg.session.identity_links[0].peers);
+    allocator.free(cfg.session.identity_links);
+}
+
+test "session config: parse identity_links array format" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"identity_links": [{"canonical": "bob", "peers": ["slack:999"]}]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.session.identity_links.len);
+    try std.testing.expectEqualStrings("bob", cfg.session.identity_links[0].canonical);
+    try std.testing.expectEqual(@as(usize, 1), cfg.session.identity_links[0].peers.len);
+    try std.testing.expectEqualStrings("slack:999", cfg.session.identity_links[0].peers[0]);
+    allocator.free(cfg.session.identity_links[0].canonical);
+    for (cfg.session.identity_links[0].peers) |p| allocator.free(p);
+    allocator.free(cfg.session.identity_links[0].peers);
+    allocator.free(cfg.session.identity_links);
+}
+
+test "session config: empty session block uses defaults" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
+    try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
+    try std.testing.expectEqual(@as(usize, 0), cfg.session.identity_links.len);
+}
+
+test "session config: all dm_scope values accepted" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{ "main", config_types.DmScope.main },
+        .{ "per-peer", config_types.DmScope.per_peer },
+        .{ "per-channel-peer", config_types.DmScope.per_channel_peer },
+        .{ "per-account-channel-peer", config_types.DmScope.per_account_channel_peer },
+        .{ "per_peer", config_types.DmScope.per_peer },
+        .{ "per_channel_peer", config_types.DmScope.per_channel_peer },
+        .{ "per_account_channel_peer", config_types.DmScope.per_account_channel_peer },
+    };
+    inline for (cases) |c| {
+        const json = "{\"session\": {\"dmScope\": \"" ++ c[0] ++ "\"}}";
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson(json);
+        try std.testing.expectEqual(c[1], cfg.session.dm_scope);
+    }
+}

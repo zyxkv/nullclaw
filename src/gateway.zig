@@ -1139,7 +1139,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 var meta_buf: [256]u8 = undefined;
                                 const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\"}}", .{state.telegram_account_id}) catch null;
                                 var kb: [64]u8 = undefined;
-                                const tg_cfg_opt: ?*const Config = if (config_opt) |*cfg| cfg else null;
+                                const tg_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
                                 const sk = telegramSessionKeyRouted(req_allocator, &kb, chat_id.?, b, tg_cfg_opt, state.telegram_account_id);
                                 _ = publishToBus(eb, req_allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
                                 response_body = "{\"status\":\"ok\"}";

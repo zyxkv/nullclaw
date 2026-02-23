@@ -245,6 +245,33 @@ fn isChannelOnly(b: AgentBinding) bool {
         b.match.roles.len == 0;
 }
 
+/// Check ALL constraints on a binding against input. Each constraint on the
+/// binding must match the corresponding input field. Null constraints match
+/// anything (they impose no restriction).
+fn allConstraintsMatch(b: AgentBinding, input: RouteInput, check_peer: ?PeerRef) bool {
+    // Channel + account_id already checked in pre-filter.
+    // Peer constraint: if binding has a peer, it must match the given check_peer.
+    if (b.match.peer) |bp| {
+        const ip = check_peer orelse return false;
+        if (bp.kind != ip.kind or !std.mem.eql(u8, bp.id, ip.id)) return false;
+    }
+    // Guild constraint
+    if (b.match.guild_id) |bg| {
+        const ig = input.guild_id orelse return false;
+        if (!std.mem.eql(u8, bg, ig)) return false;
+    }
+    // Team constraint
+    if (b.match.team_id) |bt| {
+        const it = input.team_id orelse return false;
+        if (!std.mem.eql(u8, bt, it)) return false;
+    }
+    // Roles constraint
+    if (b.match.roles.len > 0) {
+        if (!hasMatchingRole(b.match.roles, input.member_role_ids)) return false;
+    }
+    return true;
+}
+
 /// Check if any role in `binding_roles` appears in `member_roles`.
 fn hasMatchingRole(binding_roles: []const []const u8, member_roles: []const []const u8) bool {
     for (binding_roles) |br| {
@@ -280,52 +307,53 @@ pub fn resolveRoute(
         }
     }
 
-    // Tier 1: peer match
-    for (candidates.items) |b| {
-        if (peerMatches(b.match.peer, input.peer)) {
-            return buildRoute(allocator, b.agent_id, input, .peer);
+    // Tier 1: peer match — binding has a peer constraint that matches input.peer
+    if (input.peer) |ip| {
+        for (candidates.items) |b| {
+            if (b.match.peer != null and allConstraintsMatch(b, input, ip)) {
+                return buildRoute(allocator, b.agent_id, input, .peer);
+            }
         }
     }
 
-    // Tier 2: parent_peer match
-    for (candidates.items) |b| {
-        if (peerMatches(b.match.peer, input.parent_peer)) {
-            return buildRoute(allocator, b.agent_id, input, .parent_peer);
+    // Tier 2: parent_peer match — binding peer matches input.parent_peer
+    if (input.parent_peer) |pp| {
+        if (pp.id.len > 0) {
+            for (candidates.items) |b| {
+                if (b.match.peer != null and allConstraintsMatch(b, input, pp)) {
+                    return buildRoute(allocator, b.agent_id, input, .parent_peer);
+                }
+            }
         }
     }
 
     // Tier 3: guild_id + roles match
-    for (candidates.items) |b| {
-        if (b.match.guild_id) |bg| {
-            if (input.guild_id) |ig| {
-                if (std.mem.eql(u8, bg, ig) and
-                    b.match.roles.len > 0 and
-                    hasMatchingRole(b.match.roles, input.member_role_ids))
-                {
-                    return buildRoute(allocator, b.agent_id, input, .guild_roles);
-                }
+    if (input.guild_id != null and input.member_role_ids.len > 0) {
+        for (candidates.items) |b| {
+            if (b.match.guild_id != null and b.match.roles.len > 0 and
+                allConstraintsMatch(b, input, input.peer))
+            {
+                return buildRoute(allocator, b.agent_id, input, .guild_roles);
             }
         }
     }
 
     // Tier 4: guild_id only (no roles on binding)
-    for (candidates.items) |b| {
-        if (b.match.guild_id) |bg| {
-            if (input.guild_id) |ig| {
-                if (std.mem.eql(u8, bg, ig) and b.match.roles.len == 0) {
-                    return buildRoute(allocator, b.agent_id, input, .guild);
-                }
+    if (input.guild_id != null) {
+        for (candidates.items) |b| {
+            if (b.match.guild_id != null and b.match.roles.len == 0 and
+                allConstraintsMatch(b, input, input.peer))
+            {
+                return buildRoute(allocator, b.agent_id, input, .guild);
             }
         }
     }
 
     // Tier 5: team_id match
-    for (candidates.items) |b| {
-        if (b.match.team_id) |bt| {
-            if (input.team_id) |it| {
-                if (std.mem.eql(u8, bt, it)) {
-                    return buildRoute(allocator, b.agent_id, input, .team);
-                }
+    if (input.team_id != null) {
+        for (candidates.items) |b| {
+            if (b.match.team_id != null and allConstraintsMatch(b, input, input.peer)) {
+                return buildRoute(allocator, b.agent_id, input, .team);
             }
         }
     }
@@ -904,4 +932,461 @@ test "resolveRoute — main_session_key is always set" {
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
     try std.testing.expectEqualStrings("agent:main:main", route.main_session_key);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Parity tests: route resolution, session keys, multi-account, normalization
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "resolveRoute — defaults to main/default when no bindings" {
+    const allocator = std.testing.allocator;
+    const route = try resolveRoute(allocator, .{
+        .channel = "whatsapp",
+        .account_id = "default",
+    }, &.{}, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("main", route.agent_id);
+    try std.testing.expectEqualStrings("default", route.account_id);
+    try std.testing.expectEqualStrings("agent:main:main", route.main_session_key);
+    try std.testing.expectEqual(MatchedBy.default, route.matched_by);
+}
+
+test "resolveRoute — peer binding wins over account binding" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "a",
+            .match = .{
+                .channel = "whatsapp",
+                .account_id = "biz",
+                .peer = .{ .kind = .direct, .id = "+1000" },
+            },
+        },
+        .{
+            .agent_id = "b",
+            .match = .{
+                .channel = "whatsapp",
+                .account_id = "biz",
+            },
+        },
+    };
+    const route = try resolveRoute(allocator, .{
+        .channel = "whatsapp",
+        .account_id = "biz",
+        .peer = .{ .kind = .direct, .id = "+1000" },
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("a", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.peer, route.matched_by);
+}
+
+test "resolveRoute — missing accountId in binding matches only that account" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{.{
+        .agent_id = "default-acct",
+        .match = .{ .channel = "whatsapp", .account_id = "default" },
+    }};
+    // default account: matches
+    const r1 = try resolveRoute(allocator, .{
+        .channel = "whatsapp",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "+1000" },
+    }, &bindings, &.{});
+    defer allocator.free(r1.session_key);
+    defer allocator.free(r1.main_session_key);
+    try std.testing.expectEqualStrings("default-acct", r1.agent_id);
+    try std.testing.expectEqual(MatchedBy.account, r1.matched_by);
+
+    // different account: no match, falls to default
+    const r2 = try resolveRoute(allocator, .{
+        .channel = "whatsapp",
+        .account_id = "biz",
+        .peer = .{ .kind = .direct, .id = "+1000" },
+    }, &bindings, &.{});
+    defer allocator.free(r2.session_key);
+    defer allocator.free(r2.main_session_key);
+    try std.testing.expectEqualStrings("main", r2.agent_id);
+    try std.testing.expectEqual(MatchedBy.default, r2.matched_by);
+}
+
+test "resolveRoute — defaultAgentId used when no binding matches" {
+    const allocator = std.testing.allocator;
+    const agents = [_]NamedAgentConfig{.{
+        .name = "home",
+        .provider = "openai",
+        .model = "gpt-4",
+    }};
+    const route = try resolveRoute(allocator, .{
+        .channel = "whatsapp",
+        .account_id = "biz",
+        .peer = .{ .kind = .direct, .id = "+1000" },
+    }, &.{}, &agents);
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("home", route.agent_id);
+    try std.testing.expectEqualStrings("agent:home:main", route.main_session_key);
+}
+
+test "resolveRoute — peer+guild binding requires guild match" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{.{
+        .agent_id = "bot",
+        .match = .{
+            .channel = "discord",
+            .peer = .{ .kind = .direct, .id = "user1" },
+            .guild_id = "guild1",
+        },
+    }};
+    // guild matches: peer wins
+    const r1 = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "user1" },
+        .guild_id = "guild1",
+    }, &bindings, &.{});
+    defer allocator.free(r1.session_key);
+    defer allocator.free(r1.main_session_key);
+    try std.testing.expectEqualStrings("bot", r1.agent_id);
+
+    // guild mismatch: no match
+    const r2 = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "user1" },
+        .guild_id = "guild2",
+    }, &bindings, &.{});
+    defer allocator.free(r2.session_key);
+    defer allocator.free(r2.main_session_key);
+    try std.testing.expectEqual(MatchedBy.default, r2.matched_by);
+}
+
+test "resolveRoute — guild binding wins over account when peer not bound" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "guild-bot",
+            .match = .{ .channel = "discord", .guild_id = "guild1" },
+        },
+        .{
+            .agent_id = "acct-bot",
+            .match = .{ .channel = "discord", .account_id = "default" },
+        },
+    };
+    const route = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .guild_id = "guild1",
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("guild-bot", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.guild, route.matched_by);
+}
+
+test "resolveRoute — peer binding still beats guild+roles" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "role-bot",
+            .match = .{ .channel = "discord", .guild_id = "g1", .roles = &.{"admin"} },
+        },
+        .{
+            .agent_id = "peer-bot",
+            .match = .{ .channel = "discord", .peer = .{ .kind = .direct, .id = "u1" } },
+        },
+    };
+    const route = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "u1" },
+        .guild_id = "g1",
+        .member_role_ids = &.{"admin"},
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("peer-bot", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.peer, route.matched_by);
+}
+
+test "resolveRoute — no member_role_ids means guild+roles doesn't match" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{.{
+        .agent_id = "role-bot",
+        .match = .{ .channel = "discord", .guild_id = "g1", .roles = &.{"admin"} },
+    }};
+    const route = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .guild_id = "g1",
+        // no member_role_ids
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqual(MatchedBy.default, route.matched_by);
+}
+
+test "resolveRoute — empty roles treated as no role restriction (guild tier)" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{.{
+        .agent_id = "guild-bot",
+        .match = .{ .channel = "discord", .guild_id = "g1", .roles = &.{} },
+    }};
+    const route = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .guild_id = "g1",
+        .member_role_ids = &.{"admin"},
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    // Empty roles = guild-only binding (tier 4), not guild+roles (tier 3)
+    try std.testing.expectEqualStrings("guild-bot", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.guild, route.matched_by);
+}
+
+test "resolveRoute — first matching binding wins with multiple role bindings" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "first-bot",
+            .match = .{ .channel = "discord", .guild_id = "g1", .roles = &.{"mod"} },
+        },
+        .{
+            .agent_id = "second-bot",
+            .match = .{ .channel = "discord", .guild_id = "g1", .roles = &.{"admin"} },
+        },
+    };
+    const route = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .guild_id = "g1",
+        .member_role_ids = &.{ "mod", "admin" },
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("first-bot", route.agent_id);
+}
+
+test "resolveRoute — parent_peer binding wins over guild binding" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "guild-bot",
+            .match = .{ .channel = "discord", .guild_id = "g1" },
+        },
+        .{
+            .agent_id = "parent-bot",
+            .match = .{
+                .channel = "discord",
+                .peer = .{ .kind = .channel, .id = "ch99" },
+            },
+        },
+    };
+    const route = try resolveRoute(allocator, .{
+        .channel = "discord",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "user1" },
+        .parent_peer = .{ .kind = .channel, .id = "ch99" },
+        .guild_id = "g1",
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+    try std.testing.expectEqualStrings("parent-bot", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.parent_peer, route.matched_by);
+}
+
+// ── dmScope session key tests ───────────────────────────────────────────
+
+test "dmScope controls direct-message session key isolation" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{ config_types.DmScope.per_peer, "agent:bot:direct:+15551234567" },
+        .{ config_types.DmScope.per_channel_peer, "agent:bot:whatsapp:direct:+15551234567" },
+        .{ config_types.DmScope.main, "agent:bot:main" },
+        .{ config_types.DmScope.per_account_channel_peer, "agent:bot:whatsapp:default:direct:+15551234567" },
+    };
+    inline for (cases) |c| {
+        const key = try buildSessionKeyWithScope(
+            allocator,
+            "bot",
+            "whatsapp",
+            .{ .kind = .direct, .id = "+15551234567" },
+            c[0],
+            null,
+            &.{},
+        );
+        defer allocator.free(key);
+        try std.testing.expectEqualStrings(c[1], key);
+    }
+}
+
+test "per_account_channel_peer isolates per account, channel, sender" {
+    const allocator = std.testing.allocator;
+    const key = try buildSessionKeyWithScope(
+        allocator, "main", "telegram",
+        .{ .kind = .direct, .id = "7550356539" },
+        .per_account_channel_peer, "tasks", &.{},
+    );
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:main:telegram:tasks:direct:7550356539", key);
+}
+
+test "per_account_channel_peer uses default when account not provided" {
+    const allocator = std.testing.allocator;
+    const key = try buildSessionKeyWithScope(
+        allocator, "main", "telegram",
+        .{ .kind = .direct, .id = "7550356539" },
+        .per_account_channel_peer, null, &.{},
+    );
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:main:telegram:default:direct:7550356539", key);
+}
+
+test "identityLinks applies to per_peer scope" {
+    const allocator = std.testing.allocator;
+    const links = [_]config_types.IdentityLink{.{
+        .canonical = "alice",
+        .peers = &.{ "telegram:111111111", "discord:222222222222222222" },
+    }};
+    const key = try buildSessionKeyWithScope(
+        allocator, "main", "telegram",
+        .{ .kind = .direct, .id = "telegram:111111111" },
+        .per_peer, null, &links,
+    );
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:main:direct:alice", key);
+}
+
+test "identityLinks applies to per_channel_peer scope" {
+    const allocator = std.testing.allocator;
+    const links = [_]config_types.IdentityLink{.{
+        .canonical = "alice",
+        .peers = &.{ "telegram:111111111", "discord:222222222222222222" },
+    }};
+    const key = try buildSessionKeyWithScope(
+        allocator, "main", "discord",
+        .{ .kind = .direct, .id = "discord:222222222222222222" },
+        .per_channel_peer, null, &links,
+    );
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:main:discord:direct:alice", key);
+}
+
+// ── Session key continuity (DM vs group produce distinct keys) ──────────
+
+test "distinct keys for DM vs channel — main scope" {
+    const allocator = std.testing.allocator;
+    const dm_key = try buildSessionKeyWithScope(
+        allocator, "main", "discord",
+        .{ .kind = .direct, .id = "user123" },
+        .main, "default", &.{},
+    );
+    defer allocator.free(dm_key);
+    const group_key = try buildSessionKeyWithScope(
+        allocator, "main", "discord",
+        .{ .kind = .channel, .id = "channel456" },
+        .main, "default", &.{},
+    );
+    defer allocator.free(group_key);
+    try std.testing.expectEqualStrings("agent:main:main", dm_key);
+    try std.testing.expectEqualStrings("agent:main:discord:channel:channel456", group_key);
+    try std.testing.expect(!std.mem.eql(u8, dm_key, group_key));
+}
+
+test "distinct keys for DM vs channel — per_peer scope" {
+    const allocator = std.testing.allocator;
+    const dm_key = try buildSessionKeyWithScope(
+        allocator, "main", "discord",
+        .{ .kind = .direct, .id = "user123" },
+        .per_peer, "default", &.{},
+    );
+    defer allocator.free(dm_key);
+    const group_key = try buildSessionKeyWithScope(
+        allocator, "main", "discord",
+        .{ .kind = .channel, .id = "channel456" },
+        .per_peer, "default", &.{},
+    );
+    defer allocator.free(group_key);
+    try std.testing.expectEqualStrings("agent:main:direct:user123", dm_key);
+    try std.testing.expectEqualStrings("agent:main:discord:channel:channel456", group_key);
+    try std.testing.expect(!std.mem.eql(u8, dm_key, group_key));
+}
+
+// ── normalizeId parity tests ────────────────────────────────────────────
+
+test "normalizeId — defaults missing/empty values to default" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("default", normalizeId(&buf, ""));
+    try std.testing.expectEqualStrings("default", normalizeId(&buf, "   "));
+}
+
+test "normalizeId — normalizes valid ids to lowercase" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("business-1", normalizeId(&buf, "  Business_1  "));
+}
+
+test "normalizeId — sanitizes invalid characters" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("prod-us-east", normalizeId(&buf, " Prod/US East "));
+}
+
+test "normalizeId — truncates at 64 chars" {
+    var buf: [64]u8 = undefined;
+    const long_input = "a" ** 100;
+    const result = normalizeId(&buf, long_input);
+    try std.testing.expectEqual(@as(usize, 64), result.len);
+}
+
+// ── Thread session key parity tests ─────────────────────────────────────
+
+test "buildThreadSessionKey — topic suffix for telegram groups" {
+    const allocator = std.testing.allocator;
+    const base = "agent:main:telegram:group:1";
+    const key = try buildThreadSessionKey(allocator, base, "55");
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:main:telegram:group:1:thread:55", key);
+}
+
+test "resolveThreadParentSessionKey — parses thread suffix" {
+    const parent = resolveThreadParentSessionKey("agent:main:slack:channel:C1:thread:123.456");
+    try std.testing.expect(parent != null);
+    try std.testing.expectEqualStrings("agent:main:slack:channel:C1", parent.?);
+}
+
+test "resolveThreadParentSessionKey — DM without thread returns null" {
+    const parent = resolveThreadParentSessionKey("agent:main:telegram:direct:user-1");
+    try std.testing.expect(parent == null);
+}
+
+// ── buildMainSessionKey normalizes agent id ─────────────────────────────
+
+test "buildMainSessionKey — normalizes agent id" {
+    const allocator = std.testing.allocator;
+    const key = try buildMainSessionKey(allocator, "  Research Bot  ");
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:research-bot:main", key);
+}
+
+test "buildMainSessionKey — empty agent id defaults to main" {
+    const allocator = std.testing.allocator;
+    const key = try buildMainSessionKey(allocator, "");
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:default:main", key);
+}
+
+// ── resolveLinkedPeerId parity ──────────────────────────────────────────
+
+test "resolveLinkedPeerId — multiple links, first match wins" {
+    const links = [_]config_types.IdentityLink{
+        .{ .canonical = "alice", .peers = &.{ "telegram:111", "discord:222" } },
+        .{ .canonical = "bob", .peers = &.{"telegram:333"} },
+    };
+    try std.testing.expectEqualStrings("alice", resolveLinkedPeerId("discord:222", &links));
+    try std.testing.expectEqualStrings("bob", resolveLinkedPeerId("telegram:333", &links));
+}
+
+test "resolveLinkedPeerId — empty links returns original" {
+    try std.testing.expectEqualStrings("user42", resolveLinkedPeerId("user42", &.{}));
 }

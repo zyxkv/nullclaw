@@ -1501,28 +1501,37 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     // Session config
     if (root.get("session")) |sess| {
         if (sess == .object) {
-            if (sess.object.get("dm_scope")) |v| {
+            // Accept both "dm_scope" (snake_case) and "dmScope" (camelCase)
+            const dm_val = sess.object.get("dm_scope") orelse sess.object.get("dmScope");
+            if (dm_val) |v| {
                 if (v == .string) {
-                    if (std.mem.eql(u8, v.string, "main")) {
+                    const s = v.string;
+                    // Accept both dash and underscore formats
+                    if (std.mem.eql(u8, s, "main")) {
                         self.session.dm_scope = .main;
-                    } else if (std.mem.eql(u8, v.string, "per_peer")) {
+                    } else if (std.mem.eql(u8, s, "per_peer") or std.mem.eql(u8, s, "per-peer")) {
                         self.session.dm_scope = .per_peer;
-                    } else if (std.mem.eql(u8, v.string, "per_channel_peer")) {
+                    } else if (std.mem.eql(u8, s, "per_channel_peer") or std.mem.eql(u8, s, "per-channel-peer")) {
                         self.session.dm_scope = .per_channel_peer;
-                    } else if (std.mem.eql(u8, v.string, "per_account_channel_peer")) {
+                    } else if (std.mem.eql(u8, s, "per_account_channel_peer") or std.mem.eql(u8, s, "per-account-channel-peer")) {
                         self.session.dm_scope = .per_account_channel_peer;
                     }
                 }
             }
-            if (sess.object.get("idle_minutes")) |v| {
+            const idle_val = sess.object.get("idle_minutes") orelse sess.object.get("idleMinutes");
+            if (idle_val) |v| {
                 if (v == .integer) self.session.idle_minutes = @intCast(v.integer);
             }
-            if (sess.object.get("typing_interval_secs")) |v| {
+            const typing_val = sess.object.get("typing_interval_secs") orelse sess.object.get("typingIntervalSecs");
+            if (typing_val) |v| {
                 if (v == .integer) self.session.typing_interval_secs = @intCast(v.integer);
             }
-            if (sess.object.get("identity_links")) |links| {
+            // Accept both "identity_links" (snake_case) and "identityLinks" (camelCase)
+            const links_val = sess.object.get("identity_links") orelse sess.object.get("identityLinks");
+            if (links_val) |links| {
+                var link_list: std.ArrayListUnmanaged(types.IdentityLink) = .empty;
                 if (links == .array) {
-                    var link_list: std.ArrayListUnmanaged(types.IdentityLink) = .empty;
+                    // Array format: [{"canonical": "alice", "peers": ["telegram:111"]}]
                     for (links.array.items) |item| {
                         if (item != .object) continue;
                         const canonical = item.object.get("canonical") orelse continue;
@@ -1537,8 +1546,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         try link_list.append(self.allocator, link);
                     }
-                    self.session.identity_links = try link_list.toOwnedSlice(self.allocator);
+                } else if (links == .object) {
+                    // Map format: {"alice": ["telegram:111", "discord:222"]}
+                    var it = links.object.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.key_ptr.*.len == 0) continue;
+                        if (entry.value_ptr.* != .array) continue;
+                        var link: types.IdentityLink = .{
+                            .canonical = try self.allocator.dupe(u8, entry.key_ptr.*),
+                        };
+                        link.peers = try parseStringArray(self.allocator, entry.value_ptr.array);
+                        try link_list.append(self.allocator, link);
+                    }
                 }
+                self.session.identity_links = try link_list.toOwnedSlice(self.allocator);
             }
         }
     }
