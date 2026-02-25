@@ -490,6 +490,7 @@ fn resolveInboundRouteSessionKey(
 const InboundIndicatorMode = enum {
     none,
     slack_status,
+    discord_typing,
 };
 
 const SlackStatusTarget = struct {
@@ -528,8 +529,8 @@ fn sendInboundProcessingIndicator(
 
     if (std.mem.eql(u8, channel_name, "discord")) {
         const discord_ch: *channels_mod.discord.DiscordChannel = @ptrCast(@alignCast(ch.ptr));
-        discord_ch.sendTypingIndicator(chat_id);
-        return .none;
+        discord_ch.typing_indicator.start(discord_ch, chat_id);
+        return .discord_typing;
     }
 
     if (std.mem.eql(u8, channel_name, "mattermost")) {
@@ -556,7 +557,20 @@ fn clearInboundProcessingIndicator(
     meta: channel_adapters.InboundMetadata,
     mode: InboundIndicatorMode,
 ) void {
-    if (mode != .slack_status) return;
+    if (mode == .none) return;
+
+    if (mode == .discord_typing) {
+        const channel_opt = if (account_id) |aid|
+            registry.findByNameAccount(channel_name, aid)
+        else
+            registry.findByName(channel_name);
+        if (channel_opt) |ch| {
+            const discord_ch: *channels_mod.discord.DiscordChannel = @ptrCast(@alignCast(ch.ptr));
+            discord_ch.typing_indicator.stop();
+        }
+        return;
+    }
+
     if (!std.mem.eql(u8, channel_name, "slack")) return;
 
     const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return;

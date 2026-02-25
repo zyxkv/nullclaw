@@ -21,6 +21,9 @@ pub const DiscordChannel = struct {
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
+    // Typing indicator (persistent loop, started/stopped per inbound message)
+    typing_indicator: TypingIndicator = .{},
+
     // Gateway state
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     sequence: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
@@ -811,6 +814,57 @@ pub const DiscordChannel = struct {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// Periodic Typing Indicator
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Periodic typing indicator — sends "typing" action every 8 seconds
+/// until stopped. Discord typing status expires after ~10 seconds.
+pub const TypingIndicator = struct {
+    channel: *DiscordChannel = undefined,
+    channel_id: [128]u8 = undefined,
+    channel_id_len: usize = 0,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    /// How often to re-send the typing indicator (nanoseconds).
+    const INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
+
+    /// Start the periodic typing indicator for a channel.
+    pub fn start(self: *TypingIndicator, ch: *DiscordChannel, channel_id: []const u8) void {
+        if (self.running.load(.acquire)) return; // already running
+        if (channel_id.len > self.channel_id.len) return;
+
+        self.channel = ch;
+        @memcpy(self.channel_id[0..channel_id.len], channel_id);
+        self.channel_id_len = channel_id.len;
+        self.running.store(true, .release);
+
+        self.thread = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{self}) catch null;
+    }
+
+    /// Stop the periodic typing indicator.
+    pub fn stop(self: *TypingIndicator) void {
+        self.running.store(false, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn typingLoop(self: *TypingIndicator) void {
+        while (self.running.load(.acquire)) {
+            self.channel.sendTypingIndicator(self.channel_id[0..self.channel_id_len]);
+            // Sleep in small increments to check running flag responsively
+            var elapsed: u64 = 0;
+            while (elapsed < INTERVAL_NS and self.running.load(.acquire)) {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                elapsed += 100 * std.time.ns_per_ms;
+            }
+        }
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -829,6 +883,34 @@ test "discord typing url" {
 test "discord sendTypingIndicator is no-op in tests" {
     var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
     ch.sendTypingIndicator("123456");
+}
+
+test "discord TypingIndicator init" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    try std.testing.expect(!ch.typing_indicator.running.load(.acquire));
+    try std.testing.expect(ch.typing_indicator.thread == null);
+}
+
+test "discord TypingIndicator start and stop" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    ch.typing_indicator.start(&ch, "123456");
+    try std.testing.expect(ch.typing_indicator.running.load(.acquire));
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    ch.typing_indicator.stop();
+    try std.testing.expect(!ch.typing_indicator.running.load(.acquire));
+    try std.testing.expect(ch.typing_indicator.thread == null);
+}
+
+test "discord TypingIndicator double start is safe" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    ch.typing_indicator.start(&ch, "123456");
+    ch.typing_indicator.start(&ch, "123456"); // should be a no-op
+    ch.typing_indicator.stop();
+}
+
+test "discord TypingIndicator stop without start is safe" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    ch.typing_indicator.stop(); // should not crash
 }
 
 test "discord extract bot user id" {
