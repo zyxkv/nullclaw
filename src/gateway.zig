@@ -514,6 +514,68 @@ fn constantTimeEql(a: *const [32]u8, b: *const [32]u8) bool {
 
 // ── JSON Helpers ────────────────────────────────────────────────
 
+/// Escape a string for safe embedding inside a JSON string value.
+/// Handles: \ → \\, " → \", control chars (0x00-0x1F) → \uXXXX,
+/// newlines → \n, tabs → \t, carriage returns → \r.
+pub fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
+/// Wrap a value as a JSON string field: `"key":"escaped_value"`.
+/// Returns an owned slice allocated with the provided allocator.
+pub fn jsonWrapField(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('"');
+    try w.writeAll(key);
+    try w.writeAll("\":\"");
+    try jsonEscapeInto(w, value);
+    try w.writeByte('"');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON response object: `{"status":"ok","response":"<escaped>"}`.
+/// Returns an owned slice. Caller must free.
+pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"status\":\"ok\",\"response\":\"");
+    try jsonEscapeInto(w, response);
+    try w.writeAll("\"}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON challenge response: `{"challenge":"<escaped>"}`.
+/// Returns an owned slice. Caller must free.
+fn jsonWrapChallenge(allocator: std.mem.Allocator, challenge: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"challenge\":\"");
+    try jsonEscapeInto(w, challenge);
+    try w.writeAll("\"}");
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Extract a string field from a JSON blob (minimal parser, no allocations).
 pub fn jsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
     var needle_buf: [256]u8 = undefined;
@@ -1596,7 +1658,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         }
-        const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{challenge}) catch {
+        const challenge_resp = jsonWrapChallenge(ctx.req_allocator, challenge) catch {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         };
@@ -1904,7 +1966,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (std.mem.indexOf(u8, body, "\"url_verification\"") != null) {
         const challenge = jsonStringField(body, "challenge");
         if (challenge) |c| {
-            const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{c}) catch null;
+            const challenge_resp = jsonWrapChallenge(ctx.req_allocator, c) catch null;
             ctx.response_body = challenge_resp orelse "{\"status\":\"ok\"}";
         } else {
             ctx.response_body = "{\"status\":\"ok\"}";
@@ -2213,7 +2275,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 };
                                 if (reply) |r| {
                                     defer allocator.free(r);
-                                    const json_resp = std.fmt.allocPrint(req_allocator, "{{\"status\":\"ok\",\"response\":\"{s}\"}}", .{r}) catch null;
+                                    const json_resp = jsonWrapResponse(req_allocator, r) catch null;
                                     response_body = json_resp orelse "{\"status\":\"received\"}";
                                 } else {
                                     response_body = "{\"status\":\"received\"}";
@@ -3749,4 +3811,140 @@ test "GatewayState event_bus defaults to null" {
     var gs = GatewayState.init(std.testing.allocator);
     defer gs.deinit();
     try std.testing.expect(gs.event_bus == null);
+}
+
+// ── jsonEscapeInto tests ────────────────────────────────────────
+
+fn escapeToString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try jsonEscapeInto(w, input);
+    return buf.toOwnedSlice(allocator);
+}
+
+test "jsonEscapeInto escapes double quotes" {
+    const result = try escapeToString(std.testing.allocator, "hello \"world\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello \\\"world\\\"", result);
+}
+
+test "jsonEscapeInto escapes backslashes" {
+    const result = try escapeToString(std.testing.allocator, "path\\to\\file");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", result);
+}
+
+test "jsonEscapeInto escapes newlines and tabs" {
+    const result = try escapeToString(std.testing.allocator, "line1\nline2\ttab");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("line1\\nline2\\ttab", result);
+}
+
+test "jsonEscapeInto escapes control chars as unicode" {
+    // 0x00, 0x01, 0x1F
+    const result = try escapeToString(std.testing.allocator, &[_]u8{ 0x00, 0x01, 0x1F });
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\\u0000\\u0001\\u001f", result);
+}
+
+test "jsonEscapeInto empty string yields empty output" {
+    const result = try escapeToString(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "jsonEscapeInto passes through unicode and emoji unchanged" {
+    const result = try escapeToString(std.testing.allocator, "hello \xc3\xa9\xf0\x9f\x98\x80 world");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello \xc3\xa9\xf0\x9f\x98\x80 world", result);
+}
+
+test "jsonEscapeInto escapes carriage return" {
+    const result = try escapeToString(std.testing.allocator, "hello\r\nworld");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello\\r\\nworld", result);
+}
+
+test "jsonEscapeInto escapes backspace and form feed" {
+    const result = try escapeToString(std.testing.allocator, "a\x08b\x0Cc");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a\\bb\\fc", result);
+}
+
+test "jsonEscapeInto mixed special characters" {
+    const result = try escapeToString(std.testing.allocator, "He said \"hi\\there\"\nnew line");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("He said \\\"hi\\\\there\\\"\\nnew line", result);
+}
+
+// ── jsonWrapField tests ─────────────────────────────────────────
+
+test "jsonWrapField produces valid JSON string field" {
+    const result = try jsonWrapField(std.testing.allocator, "msg", "hello \"world\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"msg\":\"hello \\\"world\\\"\"", result);
+}
+
+test "jsonWrapField with empty value" {
+    const result = try jsonWrapField(std.testing.allocator, "key", "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"key\":\"\"", result);
+}
+
+test "jsonWrapField result is valid JSON when wrapped in braces" {
+    const field = try jsonWrapField(std.testing.allocator, "response", "test\nvalue");
+    defer std.testing.allocator.free(field);
+    // Wrap in object: {"response":"test\nvalue"}
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{{s}}}", .{field});
+    defer std.testing.allocator.free(json);
+    // Parse to verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const val = parsed.value.object.get("response") orelse unreachable;
+    try std.testing.expect(val == .string);
+    try std.testing.expectEqualStrings("test\nvalue", val.string);
+}
+
+// ── jsonWrapResponse tests ──────────────────────────────────────
+
+test "jsonWrapResponse produces valid JSON with escaped content" {
+    const result = try jsonWrapResponse(std.testing.allocator, "Hello \"user\"\nLine 2");
+    defer std.testing.allocator.free(result);
+    // Verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const status = parsed.value.object.get("status") orelse unreachable;
+    try std.testing.expectEqualStrings("ok", status.string);
+    const response = parsed.value.object.get("response") orelse unreachable;
+    try std.testing.expectEqualStrings("Hello \"user\"\nLine 2", response.string);
+}
+
+test "jsonWrapResponse with clean input" {
+    const result = try jsonWrapResponse(std.testing.allocator, "simple reply");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\",\"response\":\"simple reply\"}", result);
+}
+
+// ── jsonWrapChallenge tests ─────────────────────────────────────
+
+test "jsonWrapChallenge produces valid JSON" {
+    const result = try jsonWrapChallenge(std.testing.allocator, "abc123");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("{\"challenge\":\"abc123\"}", result);
+}
+
+test "jsonWrapChallenge escapes malicious challenge value" {
+    const result = try jsonWrapChallenge(std.testing.allocator, "abc\",\"evil\":\"true");
+    defer std.testing.allocator.free(result);
+    // Must be valid JSON with the value properly escaped
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const challenge = parsed.value.object.get("challenge") orelse unreachable;
+    try std.testing.expectEqualStrings("abc\",\"evil\":\"true", challenge.string);
+    // Must NOT have an "evil" key (injection prevented)
+    try std.testing.expect(parsed.value.object.get("evil") == null);
 }

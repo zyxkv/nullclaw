@@ -351,3 +351,43 @@ test "hybrid merge zero weights" {
         try std.testing.expect(@abs(r.final_score) < std.math.floatEps(f32));
     }
 }
+
+// ── R3 regression tests ───────────────────────────────────────────
+
+test "cosine zero vector returns 0.0 r3" {
+    const zero = [_]f32{ 0.0, 0.0, 0.0 };
+    const other = [_]f32{ 1.0, 2.0, 3.0 };
+    try std.testing.expectEqual(@as(f32, 0.0), cosineSimilarity(&zero, &other));
+    try std.testing.expectEqual(@as(f32, 0.0), cosineSimilarity(&other, &zero));
+    try std.testing.expectEqual(@as(f32, 0.0), cosineSimilarity(&zero, &zero));
+}
+
+test "cosine identical vectors returns 1.0 r3" {
+    const v = [_]f32{ 0.5, -0.3, 0.8, 0.1 };
+    const sim = cosineSimilarity(&v, &v);
+    try std.testing.expect(@abs(sim - 1.0) < 0.0001);
+}
+
+test "cosine orthogonal vectors returns 0.0 r3" {
+    const a = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const b = [_]f32{ 0.0, 0.0, 1.0, 0.0 };
+    const sim = cosineSimilarity(&a, &b);
+    try std.testing.expect(@abs(sim) < 0.0001);
+}
+
+test "cosine NaN in vector returns 0.0 not NaN" {
+    const a = [_]f32{ 1.0, std.math.nan(f32), 3.0 };
+    const b = [_]f32{ 1.0, 2.0, 3.0 };
+    const sim = cosineSimilarity(&a, &b);
+    // Must not propagate NaN — should return 0.0
+    try std.testing.expect(!std.math.isNan(sim));
+    try std.testing.expectEqual(@as(f32, 0.0), sim);
+}
+
+test "cosine inf in vector returns 0.0" {
+    const a = [_]f32{ std.math.inf(f32), 1.0 };
+    const b = [_]f32{ 1.0, 1.0 };
+    const sim = cosineSimilarity(&a, &b);
+    try std.testing.expect(!std.math.isNan(sim));
+    try std.testing.expectEqual(@as(f32, 0.0), sim);
+}

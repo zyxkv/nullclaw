@@ -639,3 +639,49 @@ test "cache clear returns zero on empty" {
     const cleared = try cache_inst.clear();
     try std.testing.expectEqual(@as(usize, 0), cleared);
 }
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: cache key no delimiter collision — boundary-shifted fields" {
+    // These would collide with a naive delimiter approach:
+    //   ("a", "|b", "c") vs ("a", "", "b|c")
+    // Length-prefixed hashing must distinguish them.
+    const k1 = ResponseCache.cacheKey("a", "|b", "c");
+    const k2 = ResponseCache.cacheKey("a", "", "b|c");
+    try std.testing.expect(k1 != k2);
+
+    // Also verify boundary between model and system_prompt:
+    //   ("ab", "c", "d") vs ("a", "bc", "d")
+    const k3 = ResponseCache.cacheKey("ab", "c", "d");
+    const k4 = ResponseCache.cacheKey("a", "bc", "d");
+    try std.testing.expect(k3 != k4);
+
+    // And boundary between system_prompt and user_prompt:
+    //   ("m", "ab", "c") vs ("m", "a", "bc")
+    const k5 = ResponseCache.cacheKey("m", "ab", "c");
+    const k6 = ResponseCache.cacheKey("m", "a", "bc");
+    try std.testing.expect(k5 != k6);
+}
+
+test "R3: cache store then retrieve verifies content matches" {
+    var cache_inst = try ResponseCache.init(":memory:", 60, 1000);
+    defer cache_inst.deinit();
+
+    const test_response = "This is a detailed response about Zig's comptime features.";
+    var key_buf: [16]u8 = undefined;
+    const key_hex = ResponseCache.cacheKeyHex(&key_buf, "claude-3", "Be helpful", "Tell me about comptime");
+
+    try cache_inst.put(std.testing.allocator, key_hex, "claude-3", test_response, 42);
+
+    // Retrieve and verify exact content
+    const result = try cache_inst.get(std.testing.allocator, key_hex);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?);
+    try std.testing.expectEqualStrings(test_response, result.?);
+
+    // Verify a different key misses
+    var miss_buf: [16]u8 = undefined;
+    const miss_key = ResponseCache.cacheKeyHex(&miss_buf, "claude-3", "Be helpful", "different prompt");
+    const miss_result = try cache_inst.get(std.testing.allocator, miss_key);
+    try std.testing.expect(miss_result == null);
+}

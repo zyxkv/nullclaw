@@ -259,3 +259,33 @@ test "parseConversationTimestamp invalid prefix" {
 test "parseConversationTimestamp no timestamp" {
     try std.testing.expect(parseConversationTimestamp("conv_notanumber_abc") == null);
 }
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: pruneConversationRows with empty NoneMemory returns 0" {
+    var none_mem = root.NoneMemory.init();
+    defer none_mem.deinit();
+    const mem = none_mem.memory();
+
+    const pruned = try pruneConversationRows(std.testing.allocator, mem, 30);
+    try std.testing.expectEqual(@as(u64, 0), pruned);
+}
+
+test "R3: pruneConversationRows with sqlite empty store returns 0" {
+    const sqlite = @import("../engines/sqlite.zig");
+    var mem_impl = try sqlite.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    const pruned = try pruneConversationRows(std.testing.allocator, mem, 30);
+    try std.testing.expectEqual(@as(u64, 0), pruned);
+}
+
+test "R3: parseConversationTimestamp key with only prefix" {
+    try std.testing.expect(parseConversationTimestamp("conv_") == null);
+}
+
+test "R3: parseConversationTimestamp key without trailing id" {
+    const ts = parseConversationTimestamp("conv_1700000000");
+    try std.testing.expectEqual(@as(i64, 1700000000), ts.?);
+}

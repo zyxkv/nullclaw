@@ -570,3 +570,37 @@ test "formatReport without optional components" {
     try testing.expect(std.mem.indexOf(u8, text, "n/a") != null);
     try testing.expect(std.mem.indexOf(u8, text, "off") != null);
 }
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: diagnose on empty system returns valid report with formatReport" {
+    const allocator = testing.allocator;
+    var setup = try makeTestRuntime(allocator);
+    defer setup.rt.deinit();
+
+    const report = diagnose(&setup.rt);
+
+    // Verify defaults
+    try testing.expectEqualStrings("none", report.backend_name);
+    try testing.expect(report.backend_healthy);
+    try testing.expectEqual(@as(usize, 0), report.entry_count);
+    try testing.expect(!report.cache_active);
+    try testing.expect(!report.vector_store_active);
+    try testing.expect(!report.outbox_active);
+    try testing.expect(!report.session_store_active);
+    try testing.expectEqual(@as(usize, 0), report.retrieval_sources);
+    try testing.expect(!report.query_expansion_enabled);
+    try testing.expect(!report.adaptive_retrieval_enabled);
+    try testing.expect(!report.llm_reranker_enabled);
+    try testing.expect(!report.semantic_cache_active);
+
+    // Format it — should not crash and should produce non-empty output
+    const text = try formatReport(report, allocator);
+    defer allocator.free(text);
+    try testing.expect(text.len > 0);
+
+    // Check Pipeline Stages section is present (extended fields)
+    try testing.expect(std.mem.indexOf(u8, text, "Pipeline Stages") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "query_expansion") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "semantic_cache") != null);
+}

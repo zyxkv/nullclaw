@@ -496,3 +496,23 @@ test "PgvectorVectorStore healthCheck disabled returns not-ok" {
     try std.testing.expect(!status.ok);
     try std.testing.expect(status.error_msg != null);
 }
+
+// ── R3 tests ──────────────────────────────────────────────────────
+
+test "formatVector rejects NaN" {
+    const embedding = [_]f32{ 0.1, std.math.nan(f32), 0.3 };
+    const result = PgvectorVectorStore.formatVector(std.testing.allocator, &embedding);
+    try std.testing.expectError(error.InvalidEmbeddingValue, result);
+}
+
+test "formatVector rejects positive Inf" {
+    const embedding = [_]f32{ 0.1, std.math.inf(f32), 0.3 };
+    const result = PgvectorVectorStore.formatVector(std.testing.allocator, &embedding);
+    try std.testing.expectError(error.InvalidEmbeddingValue, result);
+}
+
+test "formatVector rejects negative Inf" {
+    const embedding = [_]f32{ -std.math.inf(f32), 0.2, 0.3 };
+    const result = PgvectorVectorStore.formatVector(std.testing.allocator, &embedding);
+    try std.testing.expectError(error.InvalidEmbeddingValue, result);
+}

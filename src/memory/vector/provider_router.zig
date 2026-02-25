@@ -400,3 +400,126 @@ test "buildAutoChain auto creates router with fallback" {
     try std.testing.expectEqualStrings("auto", p.getName());
     p.deinit();
 }
+
+// ── R3 tests ──────────────────────────────────────────────────────
+
+/// Test helper: embedding provider that always fails.
+const FailingTestProvider = struct {
+    allocator: ?std.mem.Allocator = null,
+
+    const Self = @This();
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "failing";
+    }
+
+    fn implDimensions(_: *anyopaque) u32 {
+        return 3;
+    }
+
+    fn implEmbed(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]f32 {
+        return error.EmbeddingApiError;
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        if (self_.allocator) |alloc| {
+            alloc.destroy(self_);
+        }
+    }
+
+    const vtable_inst = EmbeddingProvider.VTable{
+        .name = &implName,
+        .dimensions = &implDimensions,
+        .embed = &implEmbed,
+        .deinit = &implDeinit,
+    };
+
+    fn provider(self: *Self) EmbeddingProvider {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_inst,
+        };
+    }
+};
+
+test "primary available routes to primary" {
+    // Create a working primary (noop) and verify it's used
+    const noop1 = try std.testing.allocator.create(embeddings.NoopEmbedding);
+    noop1.* = .{ .allocator = std.testing.allocator };
+
+    var router = try ProviderRouter.init(
+        std.testing.allocator,
+        noop1.provider(),
+        &.{},
+        &.{},
+    );
+    const p = router.provider();
+    defer p.deinit();
+
+    // Embed should succeed via primary
+    const vec = try p.embed(std.testing.allocator, "test text");
+    defer std.testing.allocator.free(vec);
+
+    // Metrics should show primary success, no fallback
+    try std.testing.expectEqual(@as(u64, 1), router.metrics.total_calls);
+    try std.testing.expectEqual(@as(u64, 1), router.metrics.primary_successes);
+    try std.testing.expectEqual(@as(u64, 0), router.metrics.fallback_successes);
+    try std.testing.expectEqual(@as(u64, 0), router.metrics.total_failures);
+}
+
+test "primary down falls back to secondary" {
+    // Primary: always fails. Fallback: noop (always succeeds).
+    const failing = try std.testing.allocator.create(FailingTestProvider);
+    failing.* = .{ .allocator = std.testing.allocator };
+
+    const noop_fb = try std.testing.allocator.create(embeddings.NoopEmbedding);
+    noop_fb.* = .{ .allocator = std.testing.allocator };
+
+    var router = try ProviderRouter.init(
+        std.testing.allocator,
+        failing.provider(),
+        &.{noop_fb.provider()},
+        &.{},
+    );
+    const p = router.provider();
+    defer p.deinit();
+
+    // Embed should succeed via fallback
+    const vec = try p.embed(std.testing.allocator, "test text");
+    defer std.testing.allocator.free(vec);
+
+    // Metrics: primary failed, fallback succeeded
+    try std.testing.expectEqual(@as(u64, 1), router.metrics.total_calls);
+    try std.testing.expectEqual(@as(u64, 0), router.metrics.primary_successes);
+    try std.testing.expectEqual(@as(u64, 1), router.metrics.fallback_successes);
+    try std.testing.expectEqual(@as(u64, 0), router.metrics.total_failures);
+}
+
+test "all providers fail returns error" {
+    // Both primary and fallback fail
+    const failing1 = try std.testing.allocator.create(FailingTestProvider);
+    failing1.* = .{ .allocator = std.testing.allocator };
+
+    const failing2 = try std.testing.allocator.create(FailingTestProvider);
+    failing2.* = .{ .allocator = std.testing.allocator };
+
+    var router = try ProviderRouter.init(
+        std.testing.allocator,
+        failing1.provider(),
+        &.{failing2.provider()},
+        &.{},
+    );
+    const p = router.provider();
+    defer p.deinit();
+
+    // Embed should fail
+    const result = p.embed(std.testing.allocator, "test text");
+    try std.testing.expectError(error.EmbeddingApiError, result);
+
+    // Metrics: total_failures incremented
+    try std.testing.expectEqual(@as(u64, 1), router.metrics.total_calls);
+    try std.testing.expectEqual(@as(u64, 0), router.metrics.primary_successes);
+    try std.testing.expectEqual(@as(u64, 0), router.metrics.fallback_successes);
+    try std.testing.expectEqual(@as(u64, 1), router.metrics.total_failures);
+}

@@ -229,3 +229,91 @@ test "half_open probe resets after failure cycle" {
     try std.testing.expect(cb.allow()); // → half_open, new probe
     try std.testing.expectEqual(State.half_open, cb.state);
 }
+
+// ── R3 tests ──────────────────────────────────────────────────────
+
+test "full lifecycle: closed → open → half_open → probe → success → closed" {
+    var cb = CircuitBreaker.init(3, 0); // threshold=3, 0ms cooldown
+
+    // Phase 1: closed — allow succeeds
+    try std.testing.expectEqual(State.closed, cb.state);
+    try std.testing.expect(cb.allow());
+
+    // Phase 2: accumulate failures up to threshold
+    cb.recordFailure(); // count=1, still closed
+    try std.testing.expectEqual(State.closed, cb.state);
+    try std.testing.expectEqual(@as(u32, 1), cb.failure_count);
+
+    cb.recordFailure(); // count=2, still closed
+    try std.testing.expectEqual(State.closed, cb.state);
+    try std.testing.expectEqual(@as(u32, 2), cb.failure_count);
+
+    cb.recordFailure(); // count=3, trips to open
+    try std.testing.expectEqual(State.open, cb.state);
+    try std.testing.expectEqual(@as(u32, 3), cb.failure_count);
+    try std.testing.expect(cb.isOpen());
+
+    // Phase 3: cooldown expired (0ms) → allow transitions to half_open
+    try std.testing.expect(cb.allow()); // → half_open, probe sent
+    try std.testing.expectEqual(State.half_open, cb.state);
+
+    // Phase 4: single probe — second allow is blocked
+    try std.testing.expect(!cb.allow()); // blocked, only one probe
+
+    // Phase 5: probe succeeds → closed
+    cb.recordSuccess();
+    try std.testing.expectEqual(State.closed, cb.state);
+    try std.testing.expectEqual(@as(u32, 0), cb.failure_count);
+    try std.testing.expect(!cb.isOpen());
+
+    // Phase 6: after recovery, allow works normally
+    try std.testing.expect(cb.allow());
+    try std.testing.expectEqual(State.closed, cb.state);
+}
+
+test "open state blocks all requests before cooldown" {
+    var cb = CircuitBreaker.init(1, 999_999); // long cooldown
+    cb.recordFailure(); // trips immediately (threshold=1)
+    try std.testing.expectEqual(State.open, cb.state);
+
+    // Multiple allow() calls all return false — no probe allowed before cooldown
+    for (0..10) |_| {
+        try std.testing.expect(!cb.allow());
+        try std.testing.expectEqual(State.open, cb.state);
+    }
+}
+
+test "half_open allows exactly one probe then blocks" {
+    var cb = CircuitBreaker.init(1, 0);
+    cb.recordFailure(); // → open
+
+    // First allow → transitions to half_open, returns true (probe allowed)
+    try std.testing.expect(cb.allow());
+    try std.testing.expectEqual(State.half_open, cb.state);
+    try std.testing.expect(cb.half_open_probe_sent);
+
+    // Second allow → still half_open, returns false (probe already sent)
+    try std.testing.expect(!cb.allow());
+    try std.testing.expectEqual(State.half_open, cb.state);
+
+    // Third allow → still blocked
+    try std.testing.expect(!cb.allow());
+    try std.testing.expectEqual(State.half_open, cb.state);
+}
+
+test "saturating add — many failures do not overflow u32" {
+    var cb = CircuitBreaker.init(std.math.maxInt(u32), 0);
+
+    // Set failure_count near max to test saturation
+    cb.failure_count = std.math.maxInt(u32) - 1;
+    cb.recordFailure(); // should go to maxInt(u32), not overflow
+    try std.testing.expectEqual(std.math.maxInt(u32), cb.failure_count);
+
+    // One more failure — should saturate at maxInt, not wrap to 0
+    cb.recordFailure();
+    try std.testing.expectEqual(std.math.maxInt(u32), cb.failure_count);
+
+    // Another to be sure
+    cb.recordFailure();
+    try std.testing.expectEqual(std.math.maxInt(u32), cb.failure_count);
+}

@@ -177,3 +177,88 @@ test "exportSnapshot returns zero for empty memory" {
 test "SNAPSHOT_FILENAME is correct" {
     try std.testing.expectEqualStrings("MEMORY_SNAPSHOT.json", SNAPSHOT_FILENAME);
 }
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: snapshot export then import roundtrip preserves all entries" {
+    const sqlite_mod = @import("../engines/sqlite.zig");
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    // Source memory: populate with entries
+    var src_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer src_impl.deinit();
+    const src_mem = src_impl.memory();
+
+    try src_mem.store("pref_lang", "Zig is the best", .core, null);
+    try src_mem.store("pref_editor", "NeoVim forever", .core, null);
+    try src_mem.store("user_name", "Igor", .core, null);
+
+    // Export
+    const exported = try exportSnapshot(allocator, src_mem, workspace_dir);
+    try std.testing.expectEqual(@as(usize, 3), exported);
+
+    // Destination memory: empty, then hydrate
+    var dst_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer dst_impl.deinit();
+    const dst_mem = dst_impl.memory();
+
+    const hydrated = try hydrateFromSnapshot(allocator, dst_mem, workspace_dir);
+    try std.testing.expectEqual(@as(usize, 3), hydrated);
+
+    // Verify all entries are present
+    const count = try dst_mem.count();
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    // Verify specific entries
+    const e1 = try dst_mem.get(allocator, "pref_lang");
+    try std.testing.expect(e1 != null);
+    defer e1.?.deinit(allocator);
+    try std.testing.expectEqualStrings("Zig is the best", e1.?.content);
+
+    const e2 = try dst_mem.get(allocator, "pref_editor");
+    try std.testing.expect(e2 != null);
+    defer e2.?.deinit(allocator);
+    try std.testing.expectEqualStrings("NeoVim forever", e2.?.content);
+
+    const e3 = try dst_mem.get(allocator, "user_name");
+    try std.testing.expect(e3 != null);
+    defer e3.?.deinit(allocator);
+    try std.testing.expectEqualStrings("Igor", e3.?.content);
+}
+
+test "R3: shouldHydrate returns true when memory is empty and snapshot exists" {
+    const sqlite_mod = @import("../engines/sqlite.zig");
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snap_file = try tmp.dir.createFile(SNAPSHOT_FILENAME, .{});
+    snap_file.close();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try std.testing.expect(shouldHydrate(allocator, mem, workspace_dir));
+}
+
+test "R3: hydrateFromSnapshot with no file returns 0" {
+    const sqlite_mod = @import("../engines/sqlite.zig");
+    const allocator = std.testing.allocator;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    const hydrated = try hydrateFromSnapshot(allocator, mem, "/nonexistent_dir_xyz");
+    try std.testing.expectEqual(@as(usize, 0), hydrated);
+}

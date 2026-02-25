@@ -678,3 +678,92 @@ test "HealthStatus deinit with null error_msg is safe" {
     };
     status.deinit(std.testing.allocator);
 }
+
+// ── R3 tests ──────────────────────────────────────────────────────
+
+test "upsert same key updates embedding not duplicate" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+    const emb1 = [_]f32{ 1.0, 0.0, 0.0 };
+    const emb2 = [_]f32{ 0.0, 1.0, 0.0 };
+
+    try s.upsert("same_key", &emb1);
+    try std.testing.expectEqual(@as(usize, 1), try s.count());
+
+    // Upsert again with different embedding
+    try s.upsert("same_key", &emb2);
+    try std.testing.expectEqual(@as(usize, 1), try s.count()); // still 1, not 2
+
+    // Search with emb2 as query — should find "same_key" with high score
+    const results = try s.search(std.testing.allocator, &emb2, 1);
+    defer freeVectorResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("same_key", results[0].key);
+    // Score should be ~1.0 since emb2 matches the stored embedding
+    try std.testing.expect(results[0].score > 0.99);
+}
+
+test "search returns results sorted by similarity descending" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+
+    // Insert vectors with known similarity to query [1,0,0]
+    try s.upsert("exact", &[_]f32{ 1.0, 0.0, 0.0 }); // cosine = 1.0
+    try s.upsert("close", &[_]f32{ 0.9, 0.1, 0.0 }); // cosine ~ 0.994
+    try s.upsert("medium", &[_]f32{ 0.5, 0.5, 0.5 }); // cosine ~ 0.577
+    try s.upsert("far", &[_]f32{ 0.0, 0.0, 1.0 }); // cosine = 0.0
+
+    const query = [_]f32{ 1.0, 0.0, 0.0 };
+    const results = try s.search(std.testing.allocator, &query, 4);
+    defer freeVectorResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+
+    // Verify descending order
+    try std.testing.expectEqualStrings("exact", results[0].key);
+    try std.testing.expect(results[0].score >= results[1].score);
+    try std.testing.expect(results[1].score >= results[2].score);
+    try std.testing.expect(results[2].score >= results[3].score);
+
+    // Verify boundary scores
+    try std.testing.expect(results[0].score > 0.99); // exact match
+    try std.testing.expect(results[3].score < 0.01); // orthogonal
+}
+
+test "delete then search returns empty for deleted key" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+
+    const emb = [_]f32{ 1.0, 0.0, 0.0 };
+    try s.upsert("del_target", &emb);
+    try s.upsert("keep_this", &[_]f32{ 0.0, 1.0, 0.0 });
+
+    try std.testing.expectEqual(@as(usize, 2), try s.count());
+
+    // Delete del_target
+    try s.delete("del_target");
+    try std.testing.expectEqual(@as(usize, 1), try s.count());
+
+    // Search with del_target's embedding — should not find it
+    const results = try s.search(std.testing.allocator, &emb, 10);
+    defer freeVectorResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("keep_this", results[0].key);
+}

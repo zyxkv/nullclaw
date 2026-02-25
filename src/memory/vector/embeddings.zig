@@ -266,11 +266,12 @@ fn parseEmbeddingResponse(allocator: std.mem.Allocator, json_bytes: []const u8) 
     };
 
     const result = try allocator.alloc(f32, emb_array.items.len);
+    errdefer allocator.free(result);
     for (emb_array.items, 0..) |val, i| {
         result[i] = switch (val) {
             .float => |f| @floatCast(f),
             .integer => |n| @floatFromInt(n),
-            else => 0.0,
+            else => return error.InvalidEmbeddingResponse,
         };
     }
     return result;
@@ -387,7 +388,7 @@ pub fn getCachedEmbedding(db: *SqliteMemory, content_hash: []const u8, allocator
         result[i] = switch (val) {
             .float => |f| @floatCast(f),
             .integer => |n| @floatFromInt(n),
-            else => 0.0,
+            else => return error.InvalidEmbeddingCache,
         };
     }
     return result;
@@ -813,4 +814,64 @@ test "cacheEmbedding empty vector" {
     try std.testing.expect(cached != null);
     defer std.testing.allocator.free(cached.?);
     try std.testing.expectEqual(@as(usize, 0), cached.?.len);
+}
+
+// ── R3 regression tests ───────────────────────────────────────────
+
+test "parseEmbeddingResponse valid extracts correct f32 array" {
+    const json =
+        \\{"data":[{"embedding":[0.5,-0.25,1.0,0.0]}]}
+    ;
+    const result = try parseEmbeddingResponse(std.testing.allocator, json);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expect(@abs(result[0] - 0.5) < 0.0001);
+    try std.testing.expect(@abs(result[1] - (-0.25)) < 0.0001);
+    try std.testing.expect(@abs(result[2] - 1.0) < 0.0001);
+    try std.testing.expect(@abs(result[3] - 0.0) < 0.0001);
+}
+
+test "parseEmbeddingResponse root is array not object returns error" {
+    const json =
+        \\[{"embedding":[0.1,0.2]}]
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseEmbeddingResponse string value in embedding returns error not silent 0" {
+    const json =
+        \\{"data":[{"embedding":[0.1,"bad",0.3]}]}
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseEmbeddingResponse null value in embedding returns error" {
+    const json =
+        \\{"data":[{"embedding":[0.1,null,0.3]}]}
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseEmbeddingResponse bool value in embedding returns error" {
+    const json =
+        \\{"data":[{"embedding":[0.1,true,0.3]}]}
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "contentHashWithModel different models same text produce different hashes" {
+    const h1 = contentHashWithModel("identical text", "model-alpha");
+    const h2 = contentHashWithModel("identical text", "model-beta");
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "contentHashWithModel same model different text produce different hashes" {
+    const h1 = contentHashWithModel("text one", "model-x");
+    const h2 = contentHashWithModel("text two", "model-x");
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }

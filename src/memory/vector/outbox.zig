@@ -651,3 +651,148 @@ test "pendingCount after drain is reduced" {
     try testing.expectEqual(@as(u32, 3), processed);
     try testing.expectEqual(@as(usize, 0), try setup.ob.pendingCount());
 }
+
+// ── R3 tests ──────────────────────────────────────────────────────
+
+/// Helper: read the attempts count for a given memory_key from vector_outbox.
+fn getAttempts(db: ?*c.sqlite3, memory_key: []const u8) !?i32 {
+    const sql = "SELECT attempts FROM vector_outbox WHERE memory_key = ?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
+
+    rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) {
+        return c.sqlite3_column_int(stmt, 0);
+    }
+    return null;
+}
+
+/// Failing embedding provider for testing drain failure paths.
+const FailingEmbedding = struct {
+    const Self = @This();
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "failing";
+    }
+
+    fn implDimensions(_: *anyopaque) u32 {
+        return 3;
+    }
+
+    fn implEmbed(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]f32 {
+        return error.EmbeddingApiError;
+    }
+
+    fn implDeinit(_: *anyopaque) void {}
+
+    const vtable = embeddings.EmbeddingProvider.VTable{
+        .name = &implName,
+        .dimensions = &implDimensions,
+        .embed = &implEmbed,
+        .deinit = &implDeinit,
+    };
+
+    fn provider(self: *Self) embeddings.EmbeddingProvider {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+};
+
+// R3-1: enqueue → drain → verify items processed and removed
+test "enqueue drain verify items processed" {
+    const allocator = testing.allocator;
+    var setup = try testSetup(allocator);
+    defer setup.deinit();
+
+    // Insert 3 items with content
+    try insertMemory(setup.mem.db, "r3_a", "content a");
+    try insertMemory(setup.mem.db, "r3_b", "content b");
+    try insertMemory(setup.mem.db, "r3_c", "content c");
+
+    try setup.ob.enqueue("r3_a", "upsert");
+    try setup.ob.enqueue("r3_b", "upsert");
+    try setup.ob.enqueue("r3_c", "upsert");
+    try testing.expectEqual(@as(usize, 3), try setup.ob.pendingCount());
+
+    var noop = embeddings.NoopEmbedding{};
+    const ep = noop.provider();
+    const vs = setup.vs_impl.store();
+
+    const processed = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(u32, 3), processed);
+    // All items should be removed from outbox
+    try testing.expectEqual(@as(usize, 0), try totalOutboxCount(setup.mem.db));
+    try testing.expectEqual(@as(usize, 0), try setup.ob.pendingCount());
+    // Vector store should have 3 entries
+    try testing.expectEqual(@as(usize, 3), try vs.count());
+}
+
+// R3-2: enqueue → fail drain → verify retry count incremented
+test "drain failure increments retry count" {
+    const allocator = testing.allocator;
+    var setup = try testSetup(allocator);
+    defer setup.deinit();
+
+    // Insert content so drain attempts embedding (which will fail)
+    try insertMemory(setup.mem.db, "fail_key", "some content");
+    try setup.ob.enqueue("fail_key", "upsert");
+
+    // Use FailingEmbedding that always returns error
+    var failing = FailingEmbedding{};
+    const ep = failing.provider();
+    const vs = setup.vs_impl.store();
+
+    const processed = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(u32, 0), processed);
+
+    // Item should still be in outbox with attempts incremented
+    try testing.expectEqual(@as(usize, 1), try totalOutboxCount(setup.mem.db));
+    const attempts = try getAttempts(setup.mem.db, "fail_key");
+    try testing.expect(attempts != null);
+    try testing.expectEqual(@as(i32, 1), attempts.?);
+
+    // Drain again — attempts should increment again
+    const processed2 = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(u32, 0), processed2);
+    const attempts2 = try getAttempts(setup.mem.db, "fail_key");
+    try testing.expectEqual(@as(i32, 2), attempts2.?);
+
+    // Now it has reached max_retries (2) — drain should skip it
+    const processed3 = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(u32, 0), processed3);
+    // Still in outbox but not pending (attempts >= max_retries)
+    try testing.expectEqual(@as(usize, 1), try totalOutboxCount(setup.mem.db));
+    try testing.expectEqual(@as(usize, 0), try setup.ob.pendingCount());
+}
+
+// R3-3: dead letter — max retries exceeded → purge removes item
+test "dead letter purge removes exhausted items" {
+    const allocator = testing.allocator;
+    var setup = try testSetup(allocator);
+    defer setup.deinit();
+
+    // Enqueue items and manually exhaust retries
+    try setup.ob.enqueue("dead_a", "upsert");
+    try setup.ob.enqueue("dead_b", "upsert");
+    try setup.ob.enqueue("alive_c", "upsert");
+
+    // Set dead_a and dead_b past max_retries (max_retries=2)
+    try setAttempts(setup.mem.db, "dead_a", 5); // well past limit
+    try setAttempts(setup.mem.db, "dead_b", 2); // exactly at limit
+
+    // alive_c is still at attempts=0 — should survive purge
+    try testing.expectEqual(@as(usize, 3), try totalOutboxCount(setup.mem.db));
+
+    const purged = try setup.ob.purgeDeadLetters();
+    try testing.expectEqual(@as(u32, 2), purged);
+
+    // Only alive_c remains
+    try testing.expectEqual(@as(usize, 1), try totalOutboxCount(setup.mem.db));
+    try testing.expectEqual(@as(usize, 1), try setup.ob.pendingCount());
+}

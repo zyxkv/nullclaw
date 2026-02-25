@@ -605,3 +605,48 @@ test "SemanticCache put same key replaces (no duplicates)" {
     defer std.testing.allocator.free(result.?.response);
     try std.testing.expectEqualStrings("answer v3", result.?.response);
 }
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: SemanticCache put same prompt_hash twice produces only 1 row" {
+    // Regression: with AUTOINCREMENT id and no dedup, rows accumulated unboundedly.
+    // The fix is DELETE before INSERT. Verify it works.
+    var cache_inst = try SemanticCache.init(":memory:", 60, 1000, 0.95, null);
+    defer cache_inst.deinit();
+
+    // Put same hash 10 times
+    for (0..10) |_| {
+        try cache_inst.put(std.testing.allocator, "same_hash", "gpt-4", "response", 5, null);
+    }
+
+    const s = try cache_inst.stats();
+    try std.testing.expectEqual(@as(usize, 1), s.count);
+}
+
+test "R3: SemanticCache findSemanticMatch returns null below threshold" {
+    // Without an embedding provider, semantic match is skipped.
+    // Test exact-match path: a miss key should return null.
+    var cache_inst = try SemanticCache.init(":memory:", 60, 1000, 0.99, null);
+    defer cache_inst.deinit();
+
+    try cache_inst.put(std.testing.allocator, "hash_a", "gpt-4", "resp_a", 10, null);
+
+    // Query with a different hash and no embedding provider -> no semantic match, no exact match
+    const result = try cache_inst.get(std.testing.allocator, "hash_b", "some query");
+    try std.testing.expect(result == null);
+}
+
+test "R3: SemanticCache exact match returns best match above threshold" {
+    // Exact match always returns similarity 1.0 which is above any threshold
+    var cache_inst = try SemanticCache.init(":memory:", 60, 1000, 0.99, null);
+    defer cache_inst.deinit();
+
+    try cache_inst.put(std.testing.allocator, "exact_key", "gpt-4", "exact response", 10, null);
+
+    const result = try cache_inst.get(std.testing.allocator, "exact_key", null);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.response);
+    try std.testing.expectEqualStrings("exact response", result.?.response);
+    try std.testing.expect(result.?.similarity == 1.0);
+    try std.testing.expect(!result.?.semantic);
+}

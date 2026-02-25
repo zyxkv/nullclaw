@@ -157,11 +157,12 @@ pub fn parseOllamaResponse(allocator: std.mem.Allocator, json_bytes: []const u8)
     };
 
     const result = try allocator.alloc(f32, emb_array.items.len);
+    errdefer allocator.free(result);
     for (emb_array.items, 0..) |val, i| {
         result[i] = switch (val) {
             .float => |f| @floatCast(f),
             .integer => |n| @floatFromInt(n),
-            else => 0.0,
+            else => return error.InvalidEmbeddingResponse,
         };
     }
     return result;
@@ -283,4 +284,42 @@ test "parseOllamaResponse empty inner array" {
     const result = try parseOllamaResponse(std.testing.allocator, json);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+// ── R3 regression tests ───────────────────────────────────────────
+
+test "parseOllamaResponse string value returns error" {
+    const json =
+        \\{"embeddings":[["bad",0.2,0.3]]}
+    ;
+    const result = parseOllamaResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseOllamaResponse null value returns error" {
+    const json =
+        \\{"embeddings":[[0.1,null,0.3]]}
+    ;
+    const result = parseOllamaResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseOllamaResponse root is array returns error" {
+    const json =
+        \\[{"embeddings":[[0.1]]}]
+    ;
+    const result = parseOllamaResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "buildRequestBody model with quotes is properly escaped" {
+    const body = try OllamaEmbedding.buildRequestBody(std.testing.allocator, "model\"evil", "test");
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const model_val = root.object.get("model") orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("model\"evil", model_val.string);
 }

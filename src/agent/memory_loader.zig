@@ -17,6 +17,15 @@ const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
 /// ~4000 chars ~ 1000 tokens — a safe ceiling for context injection.
 const MAX_CONTEXT_BYTES: usize = 4_000;
 
+/// Truncate a UTF-8 slice to at most `max_len` bytes without splitting
+/// a multi-byte sequence. Backs up over trailing continuation bytes (0x80..0xBF).
+fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end: usize = max_len;
+    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
+    return s[0..end];
+}
+
 fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.key, key)) return true;
@@ -66,7 +75,7 @@ pub fn loadContext(
             wrote_header = true;
         }
         // Truncate individual entry content to prevent a single large memory from blowing the budget
-        const content = if (entry.content.len > MAX_CONTEXT_BYTES / 2) entry.content[0 .. MAX_CONTEXT_BYTES / 2] else entry.content;
+        const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
         try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, content });
         appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
@@ -82,7 +91,7 @@ pub fn loadContext(
                     try w.writeAll("[Memory context]\n");
                     wrote_header = true;
                 }
-                const content = if (entry.content.len > MAX_CONTEXT_BYTES / 2) entry.content[0 .. MAX_CONTEXT_BYTES / 2] else entry.content;
+                const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
                 try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, content });
                 appended += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
@@ -120,7 +129,7 @@ pub fn loadContextWithRuntime(
     try w.writeAll("[Memory context]\n");
 
     for (candidates) |cand| {
-        const snippet = if (cand.snippet.len > MAX_CONTEXT_BYTES / 2) cand.snippet[0 .. MAX_CONTEXT_BYTES / 2] else cand.snippet;
+        const snippet = truncateUtf8(cand.snippet, MAX_CONTEXT_BYTES / 2);
         try std.fmt.format(w, "- {s}: {s}\n", .{ cand.key, snippet });
         if (buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
@@ -212,4 +221,67 @@ test "loadContext with session_id includes global entries but not other sessions
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "global_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_b_fact") == null);
+}
+
+test "truncateUtf8 does not split multi-byte sequences" {
+    // ASCII-only: truncation at limit
+    try std.testing.expectEqualStrings("abc", truncateUtf8("abcdef", 3));
+
+    // Under limit: returns as-is
+    try std.testing.expectEqualStrings("ab", truncateUtf8("ab", 10));
+
+    // 2-byte char at boundary: "aaa" (3 bytes) + "Й" (D0 99 = 2 bytes)
+    const s2 = "aaa\xd0\x99";
+    // Limit 4: byte 4 is 0x99 (continuation), back up to 3 which is 0xD0 (leading) -> [0..3]
+    try std.testing.expectEqualStrings("aaa", truncateUtf8(s2, 4));
+    // Limit 5: full string fits exactly
+    try std.testing.expectEqualStrings(s2, truncateUtf8(s2, 5));
+
+    // 3-byte char "中" (E4 B8 AD) at boundary
+    const s3 = "aa\xe4\xb8\xad";
+    // Limit 3: byte 3 is 0xB8 (continuation), back to 2 -> 0xE4 (leading) -> [0..2]
+    try std.testing.expectEqualStrings("aa", truncateUtf8(s3, 3));
+    // Limit 4: byte 4 is 0xAD (continuation), back to 3 -> 0xB8 (continuation), back to 2 -> 0xE4 (leading) -> [0..2]
+    try std.testing.expectEqualStrings("aa", truncateUtf8(s3, 4));
+
+    // 4-byte emoji U+1F600 (F0 9F 98 80)
+    const s4 = "a\xf0\x9f\x98\x80";
+    // Limit 2: byte 2 is 0x9F (continuation), back to 1 -> 0xF0 (leading) -> [0..1]
+    try std.testing.expectEqualStrings("a", truncateUtf8(s4, 2));
+
+    // All results should be valid UTF-8
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s2, 4)));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s3, 3)));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s4, 2)));
+}
+
+test "enrichMessageWithRuntime with no memories returns original message" {
+    const allocator = std.testing.allocator;
+    var none_mem = memory_mod.NoneMemory.init();
+    const mem = none_mem.memory();
+
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "hello world", null);
+    defer allocator.free(enriched);
+
+    try std.testing.expectEqualStrings("hello world", enriched);
+}
+
+test "enrichMessageWithRuntime with memories prepends context" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_lang", "Zig is the favorite language", .core, null);
+
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null);
+    defer allocator.free(enriched);
+
+    // Should contain [Memory context] header and the stored entry
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "[Memory context]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "user_lang") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "Zig is the favorite language") != null);
+    // The original message should appear at the end
+    try std.testing.expect(std.mem.endsWith(u8, enriched, "language"));
 }

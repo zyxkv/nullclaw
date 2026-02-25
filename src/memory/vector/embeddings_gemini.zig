@@ -164,11 +164,12 @@ pub fn parseGeminiResponse(allocator: std.mem.Allocator, json_bytes: []const u8)
     };
 
     const result = try allocator.alloc(f32, arr.items.len);
+    errdefer allocator.free(result);
     for (arr.items, 0..) |val, i| {
         result[i] = switch (val) {
             .float => |f| @floatCast(f),
             .integer => |n| @floatFromInt(n),
-            else => 0.0,
+            else => return error.InvalidEmbeddingResponse,
         };
     }
     return result;
@@ -301,4 +302,43 @@ test "parseGeminiResponse integer values" {
     defer std.testing.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
     try std.testing.expect(@abs(result[0] - 1.0) < 0.001);
+}
+
+// ── R3 regression tests ───────────────────────────────────────────
+
+test "buildRequestBody model name with quotes is properly escaped" {
+    const body = try GeminiEmbedding.buildRequestBody(std.testing.allocator, "model\"with\"quotes", "test text");
+    defer std.testing.allocator.free(body);
+
+    // Must be valid JSON despite quotes in model name
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const model_val = root.object.get("model") orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("models/model\"with\"quotes", model_val.string);
+}
+
+test "parseGeminiResponse string value in values returns error" {
+    const json =
+        \\{"embedding":{"values":[0.1,"bad",0.3]}}
+    ;
+    const result = parseGeminiResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseGeminiResponse null value in values returns error" {
+    const json =
+        \\{"embedding":{"values":[0.1,null,0.3]}}
+    ;
+    const result = parseGeminiResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseGeminiResponse root is array returns error" {
+    const json =
+        \\[{"embedding":{"values":[0.1]}}]
+    ;
+    const result = parseGeminiResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
 }

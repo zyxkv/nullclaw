@@ -202,3 +202,43 @@ test "decide is pure function (no side effects)" {
     const d2 = policy.decide("stable-session");
     try std.testing.expect(d1 == d2);
 }
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: rollout boundary — 0% always keyword_only for canary" {
+    const policy = RolloutPolicy{ .mode = .canary, .canary_percent = 0, .shadow_percent = 0 };
+    var buf: [32]u8 = undefined;
+    for (0..100) |i| {
+        const sid = std.fmt.bufPrint(&buf, "session-{d}", .{i}) catch continue;
+        try std.testing.expect(policy.decide(sid) == .keyword_only);
+    }
+}
+
+test "R3: rollout boundary — 100% always hybrid for canary" {
+    const policy = RolloutPolicy{ .mode = .canary, .canary_percent = 100, .shadow_percent = 0 };
+    var buf: [32]u8 = undefined;
+    for (0..100) |i| {
+        const sid = std.fmt.bufPrint(&buf, "session-{d}", .{i}) catch continue;
+        try std.testing.expect(policy.decide(sid) == .hybrid);
+    }
+}
+
+test "R3: rollout init clamps >100 to 100" {
+    const cfg = config_types.MemoryReliabilityConfig{
+        .rollout_mode = "canary",
+        .canary_hybrid_percent = 200,
+        .shadow_hybrid_percent = 300,
+    };
+    const policy = RolloutPolicy.init(cfg);
+    try std.testing.expectEqual(@as(u32, 100), policy.canary_percent);
+    try std.testing.expectEqual(@as(u32, 100), policy.shadow_percent);
+}
+
+test "R3: rollout canary deterministic — same session_id across 100 calls" {
+    const policy = RolloutPolicy{ .mode = .canary, .canary_percent = 50, .shadow_percent = 0 };
+    const sid = "deterministic-session-id-xyz";
+    const first = policy.decide(sid);
+    for (0..100) |_| {
+        try std.testing.expect(policy.decide(sid) == first);
+    }
+}

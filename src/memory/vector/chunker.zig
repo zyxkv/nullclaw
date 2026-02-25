@@ -496,3 +496,52 @@ test "BOM only text treated as empty" {
     defer freeChunks(std.testing.allocator, chunks_slice);
     try std.testing.expectEqual(@as(usize, 0), chunks_slice.len);
 }
+
+// ── R3 regression tests ───────────────────────────────────────────
+
+test "empty string produces empty chunks r3" {
+    const chunks_slice = try chunkMarkdown(std.testing.allocator, "", 512);
+    defer freeChunks(std.testing.allocator, chunks_slice);
+    try std.testing.expectEqual(@as(usize, 0), chunks_slice.len);
+}
+
+test "single line shorter than max produces one chunk" {
+    const text = "Short line.";
+    const chunks_slice = try chunkMarkdown(std.testing.allocator, text, 512);
+    defer freeChunks(std.testing.allocator, chunks_slice);
+    try std.testing.expectEqual(@as(usize, 1), chunks_slice.len);
+    try std.testing.expectEqualStrings("Short line.", chunks_slice[0].content);
+}
+
+test "multi-byte UTF-8 text no mid-character splits" {
+    // Build text with multi-byte chars that exceeds chunk size
+    var text_builder: std.ArrayList(u8) = .empty;
+    defer text_builder.deinit(std.testing.allocator);
+    // 200 repetitions of a 3-byte char (U+4E16 = 世)
+    for (0..200) |_| {
+        try text_builder.appendSlice(std.testing.allocator, "\xe4\xb8\x96");
+    }
+    const chunks_slice = try chunkMarkdown(std.testing.allocator, text_builder.items, 10);
+    defer freeChunks(std.testing.allocator, chunks_slice);
+    // Verify all chunks contain valid UTF-8 (no mid-character splits)
+    for (chunks_slice) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.content));
+    }
+}
+
+test "markdown with headings splits on heading boundaries" {
+    const text = "# First\nContent of first.\n## Second\nContent of second.\n## Third\nContent of third.";
+    const chunks_slice = try chunkMarkdown(std.testing.allocator, text, 512);
+    defer freeChunks(std.testing.allocator, chunks_slice);
+    // Should have at least 3 chunks (one per heading section)
+    try std.testing.expect(chunks_slice.len >= 3);
+    // First chunk should have heading "# First"
+    try std.testing.expect(chunks_slice[0].heading != null);
+    try std.testing.expectEqualStrings("# First", chunks_slice[0].heading.?);
+    // Second chunk heading
+    try std.testing.expect(chunks_slice[1].heading != null);
+    try std.testing.expectEqualStrings("## Second", chunks_slice[1].heading.?);
+    // Third chunk heading
+    try std.testing.expect(chunks_slice[2].heading != null);
+    try std.testing.expectEqualStrings("## Third", chunks_slice[2].heading.?);
+}

@@ -735,3 +735,50 @@ test "keyToUuid differs for different keys" {
     const uuid_b = QdrantVectorStore.keyToUuid("beta");
     try std.testing.expect(!std.mem.eql(u8, &uuid_a, &uuid_b));
 }
+
+// ── R3 tests ──────────────────────────────────────────────────────
+
+test "buildUpsertPayload rejects NaN embedding" {
+    const alloc = std.testing.allocator;
+    const embedding = [_]f32{ 0.1, std.math.nan(f32), 0.3 };
+    const result = QdrantVectorStore.buildUpsertPayload(alloc, "key", &embedding);
+    try std.testing.expectError(error.InvalidEmbeddingValue, result);
+}
+
+test "buildUpsertPayload rejects Inf embedding" {
+    const alloc = std.testing.allocator;
+    const embedding = [_]f32{ std.math.inf(f32) };
+    const result = QdrantVectorStore.buildUpsertPayload(alloc, "key", &embedding);
+    try std.testing.expectError(error.InvalidEmbeddingValue, result);
+}
+
+test "buildSearchPayload rejects NaN query" {
+    const alloc = std.testing.allocator;
+    const query = [_]f32{ 0.1, std.math.nan(f32) };
+    const result = QdrantVectorStore.buildSearchPayload(alloc, &query, 5);
+    try std.testing.expectError(error.InvalidEmbeddingValue, result);
+}
+
+test "validateCollectionName rejects invalid names" {
+    try std.testing.expectError(error.InvalidCollectionName, QdrantVectorStore.validateCollectionName(""));
+    try std.testing.expectError(error.InvalidCollectionName, QdrantVectorStore.validateCollectionName("has space"));
+    try std.testing.expectError(error.InvalidCollectionName, QdrantVectorStore.validateCollectionName("has.dot"));
+    try std.testing.expectError(error.InvalidCollectionName, QdrantVectorStore.validateCollectionName("has/slash"));
+}
+
+test "validateCollectionName accepts valid names" {
+    try QdrantVectorStore.validateCollectionName("valid_name");
+    try QdrantVectorStore.validateCollectionName("valid-name");
+    try QdrantVectorStore.validateCollectionName("valid123");
+    try QdrantVectorStore.validateCollectionName("a");
+}
+
+test "QdrantVectorStore init rejects bad collection name" {
+    const result = QdrantVectorStore.init(std.testing.allocator, .{
+        .url = "http://localhost:6333",
+        .api_key = null,
+        .collection_name = "bad name!",
+        .dimensions = 3,
+    });
+    try std.testing.expectError(error.InvalidCollectionName, result);
+}

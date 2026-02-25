@@ -254,16 +254,32 @@ pub const InMemoryLruMemory = struct {
         entry_ptr.last_access = self_.nextAccess();
 
         const e = entry_ptr.*;
+
+        const id = try allocator.dupe(u8, e.key);
+        errdefer allocator.free(id);
+        const dup_key = try allocator.dupe(u8, e.key);
+        errdefer allocator.free(dup_key);
+        const dup_content = try allocator.dupe(u8, e.content);
+        errdefer allocator.free(dup_content);
+        const dup_cat: MemoryCategory = switch (e.category) {
+            .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+            else => e.category,
+        };
+        errdefer switch (dup_cat) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+        const dup_ts = try allocator.dupe(u8, e.updated_at);
+        errdefer allocator.free(dup_ts);
+        const dup_sid = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null;
+
         return MemoryEntry{
-            .id = try allocator.dupe(u8, e.key),
-            .key = try allocator.dupe(u8, e.key),
-            .content = try allocator.dupe(u8, e.content),
-            .category = switch (e.category) {
-                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
-                else => e.category,
-            },
-            .timestamp = try allocator.dupe(u8, e.updated_at),
-            .session_id = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null,
+            .id = id,
+            .key = dup_key,
+            .content = dup_content,
+            .category = dup_cat,
+            .timestamp = dup_ts,
+            .session_id = dup_sid,
             .score = null,
         };
     }
@@ -293,16 +309,32 @@ pub const InMemoryLruMemory = struct {
                 } else continue;
             }
 
+            const l_id = try allocator.dupe(u8, e.key);
+            errdefer allocator.free(l_id);
+            const l_key = try allocator.dupe(u8, e.key);
+            errdefer allocator.free(l_key);
+            const l_content = try allocator.dupe(u8, e.content);
+            errdefer allocator.free(l_content);
+            const l_cat: MemoryCategory = switch (e.category) {
+                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+                else => e.category,
+            };
+            errdefer switch (l_cat) {
+                .custom => |name| allocator.free(name),
+                else => {},
+            };
+            const l_ts = try allocator.dupe(u8, e.updated_at);
+            errdefer allocator.free(l_ts);
+            const l_sid = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null;
+            errdefer if (l_sid) |s| allocator.free(s);
+
             try results.append(allocator, .{
-                .id = try allocator.dupe(u8, e.key),
-                .key = try allocator.dupe(u8, e.key),
-                .content = try allocator.dupe(u8, e.content),
-                .category = switch (e.category) {
-                    .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
-                    else => e.category,
-                },
-                .timestamp = try allocator.dupe(u8, e.updated_at),
-                .session_id = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null,
+                .id = l_id,
+                .key = l_key,
+                .content = l_content,
+                .category = l_cat,
+                .timestamp = l_ts,
+                .session_id = l_sid,
                 .score = null,
             });
         }
@@ -623,4 +655,207 @@ test "custom category preserved" {
     const entry = (try m.get(std.testing.allocator, "k")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("my_cat", entry.category.custom);
+}
+
+// ── R3 deep review tests ──────────────────────────────────────────
+
+test "LRU store and get with empty key" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("", "content for empty key", .core, null);
+    try std.testing.expectEqual(@as(usize, 1), try m.count());
+
+    const entry = (try m.get(std.testing.allocator, "")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", entry.key);
+    try std.testing.expectEqualStrings("content for empty key", entry.content);
+}
+
+test "LRU store and get with empty content" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k", "", .core, null);
+    const entry = (try m.get(std.testing.allocator, "k")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", entry.content);
+}
+
+test "LRU store with special chars in key and content" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    const key = "key with \"quotes\" and 'apostrophes' and %wildcards%";
+    const content = "line1\nline2\ttab\r\nwindows";
+    try m.store(key, content, .core, null);
+
+    const entry = (try m.get(std.testing.allocator, key)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(key, entry.key);
+    try std.testing.expectEqualStrings(content, entry.content);
+}
+
+test "LRU recall with empty query matches everything" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "alpha", .core, null);
+    try m.store("b", "beta", .core, null);
+
+    // Empty string is substring of everything
+    const results = try m.recall(std.testing.allocator, "", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "LRU upsert session_id from null to value" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k", "v", .core, null);
+    {
+        const entry = (try m.get(std.testing.allocator, "k")).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expect(entry.session_id == null);
+    }
+
+    try m.store("k", "v2", .core, "sess-new");
+    {
+        const entry = (try m.get(std.testing.allocator, "k")).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expect(entry.session_id != null);
+        try std.testing.expectEqualStrings("sess-new", entry.session_id.?);
+    }
+}
+
+test "LRU upsert session_id from value to null" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k", "v", .core, "sess-old");
+    try m.store("k", "v2", .core, null);
+
+    const entry = (try m.get(std.testing.allocator, "k")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(entry.session_id == null);
+}
+
+test "LRU list with session_id filter" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "v1", .core, "sess-a");
+    try m.store("k2", "v2", .core, "sess-b");
+    try m.store("k3", "v3", .core, null);
+
+    const list_a = try m.list(std.testing.allocator, null, "sess-a");
+    defer root.freeEntries(std.testing.allocator, list_a);
+    try std.testing.expectEqual(@as(usize, 1), list_a.len);
+    try std.testing.expectEqualStrings("k1", list_a[0].key);
+}
+
+test "LRU list with category and session_id combined" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "v1", .core, "sess-a");
+    try m.store("k2", "v2", .daily, "sess-a");
+    try m.store("k3", "v3", .core, "sess-b");
+
+    const results = try m.list(std.testing.allocator, .core, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("k1", results[0].key);
+}
+
+test "LRU recall returns most recently accessed first" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "common", .core, null);
+    try m.store("b", "common", .core, null);
+    try m.store("c", "common", .core, null);
+
+    // Access "a" last, so it should come first in recall results
+    {
+        const entry = (try m.get(std.testing.allocator, "a")).?;
+        defer entry.deinit(std.testing.allocator);
+    }
+
+    const results = try m.recall(std.testing.allocator, "common", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    // First result should be "a" (most recently accessed)
+    try std.testing.expectEqualStrings("a", results[0].key);
+}
+
+test "LRU recall with session_id returns only matching" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "shared data", .core, "sess-a");
+    try m.store("k2", "shared data", .core, "sess-b");
+    try m.store("k3", "shared data", .core, null);
+
+    const results = try m.recall(std.testing.allocator, "shared", 10, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("k1", results[0].key);
+}
+
+test "LRU forget nonexistent key returns false" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "exists", .core, null);
+    const result = try m.forget("nonexistent");
+    try std.testing.expect(!result);
+    try std.testing.expectEqual(@as(usize, 1), try m.count());
+}
+
+test "LRU get on nonexistent key does not increment access counter" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 3);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Access counter starts at 0
+    try std.testing.expectEqual(@as(u64, 0), mem.access_counter);
+
+    const result = try m.get(std.testing.allocator, "nonexistent");
+    try std.testing.expect(result == null);
+
+    // Access counter should still be 0 (no entry touched)
+    try std.testing.expectEqual(@as(u64, 0), mem.access_counter);
+}
+
+test "LRU eviction with capacity 1" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 1);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "first", .core, null);
+    try std.testing.expectEqual(@as(usize, 1), try m.count());
+
+    try m.store("b", "second", .core, null);
+    try std.testing.expectEqual(@as(usize, 1), try m.count());
+
+    // "a" should be evicted
+    const got_a = try m.get(std.testing.allocator, "a");
+    try std.testing.expect(got_a == null);
+
+    const got_b = (try m.get(std.testing.allocator, "b")).?;
+    defer got_b.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("second", got_b.content);
 }
