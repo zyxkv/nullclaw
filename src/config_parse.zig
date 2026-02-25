@@ -776,9 +776,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (mem.object.get("vector_weight")) |v| {
                 if (v == .float) self.memory.vector_weight = v.float;
+                if (v == .integer) self.memory.vector_weight = @floatFromInt(v.integer);
             }
             if (mem.object.get("keyword_weight")) |v| {
                 if (v == .float) self.memory.keyword_weight = v.float;
+                if (v == .integer) self.memory.keyword_weight = @floatFromInt(v.integer);
             }
             if (mem.object.get("embedding_cache_size")) |v| {
                 if (v == .integer) self.memory.embedding_cache_size = @intCast(v.integer);
