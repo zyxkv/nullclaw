@@ -83,7 +83,8 @@
     "reliability": {
       "rollout_mode": "off",
       "circuit_breaker_failures": 5,
-      "circuit_breaker_cooldown_ms": 30000
+      "circuit_breaker_cooldown_ms": 30000,
+      "fallback_policy": "degrade"
     },
 
     "summarizer": {
@@ -102,6 +103,13 @@
       "host": "127.0.0.1",
       "port": 6379,
       "key_prefix": "nullclaw"
+    },
+
+    "api": {
+      "url": "http://localhost:8080",
+      "api_key": "",
+      "timeout_ms": 10000,
+      "namespace": ""
     }
   },
 

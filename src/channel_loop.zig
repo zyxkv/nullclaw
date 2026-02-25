@@ -129,10 +129,12 @@ pub const ChannelRuntime = struct {
             .mem_rt = mem_rt,
             .noop_obs = noop_obs,
         };
-        // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics.
+        // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
+        // and into memory tools for retrieval pipeline + vector sync.
         // self is heap-allocated so the pointer is stable.
         if (self.mem_rt) |*rt| {
             self.session_mgr.mem_rt = rt;
+            tools_mod.bindMemoryRuntime(tools, rt);
         }
         return self;
     }

@@ -1028,6 +1028,11 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 
+    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
+    if (mem_rt) |*rt| {
+        yc.tools.bindMemoryRuntime(tools, rt);
+    }
+
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
     defer runtime_provider.deinit();
@@ -1299,6 +1304,11 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
+    if (mem_rt) |*rt| {
+        yc.tools.bindMemoryRuntime(tools, rt);
+    }
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};

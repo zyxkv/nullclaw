@@ -8,8 +8,10 @@ const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
 
 /// Memory store tool — lets the agent persist facts to long-term memory.
+/// When a MemoryRuntime is available, also triggers vector sync after store.
 pub const MemoryStoreTool = struct {
     memory: ?Memory = null,
+    mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_store";
     pub const tool_description = "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context.";
@@ -45,6 +47,11 @@ pub const MemoryStoreTool = struct {
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };
+
+        // Vector sync: embed and upsert into vector store (best-effort)
+        if (self.mem_rt) |rt| {
+            rt.syncVectorAfterStore(allocator, key, content);
+        }
 
         const msg = try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s})", .{ key, category.toString() });
         return ToolResult{ .success = true, .output = msg };

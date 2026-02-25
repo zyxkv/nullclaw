@@ -422,6 +422,23 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
     }
 }
 
+/// Bind a MemoryRuntime to memory tools for retrieval pipeline and vector sync.
+/// Call after bindMemoryTools to enable hybrid search and vector sync.
+pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime) void {
+    for (tools) |t| {
+        if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
+            const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
+            const mt: *memory_recall.MemoryRecallTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
+            const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
+        }
+    }
+}
+
 /// Free all heap-allocated tool structs and the tools slice itself.
 /// Pairs with `allTools` / `defaultTools` / `subagentTools`.
 pub fn deinitTools(allocator: std.mem.Allocator, tools: []const Tool) void {

@@ -735,7 +735,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.flush();
         return;
     };
-    cfg.memory.backend = backends[mem_idx].key;
+    cfg.memory.backend = backends[mem_idx].name;
     cfg.memory.auto_save = backends[mem_idx].auto_save_default;
     try out.print("  -> {s}\n\n", .{backends[mem_idx].label});
 
@@ -1190,14 +1190,14 @@ fn bootstrapTemplate() []const u8 {
 
 // ── Memory backend helpers ───────────────────────────────────────
 
-/// Get the list of selectable memory backends.
-pub fn selectableBackends() []const memory_root.MemoryBackendProfile {
-    return &memory_root.selectable_backends;
+/// Get the list of selectable memory backends (from registry).
+pub fn selectableBackends() []const memory_root.BackendDescriptor {
+    return &memory_root.registry.all;
 }
 
 /// Get the default memory backend key.
 pub fn defaultBackendKey() []const u8 {
-    return memory_root.defaultBackendKey();
+    return "sqlite";
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -1264,7 +1264,7 @@ test "known_providers has entries" {
 test "selectableBackends returns non-empty" {
     const backends = selectableBackends();
     try std.testing.expect(backends.len >= 3);
-    try std.testing.expectEqualStrings("sqlite", backends[0].key);
+    try std.testing.expectEqualStrings("sqlite", backends[0].name);
 }
 
 test "BANNER contains descriptive text" {
@@ -1481,7 +1481,7 @@ test "selectableBackends has expected backends" {
     // Should have sqlite, markdown, and json at minimum
     var has_sqlite = false;
     for (backends) |b| {
-        if (std.mem.eql(u8, b.key, "sqlite")) has_sqlite = true;
+        if (std.mem.eql(u8, b.name, "sqlite")) has_sqlite = true;
     }
     try std.testing.expect(has_sqlite);
 }

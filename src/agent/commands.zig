@@ -1589,6 +1589,38 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "poll")) return try handlePollCommand(self);
     if (isSlashName(cmd, "skill")) return try handleSkillCommand(self, cmd.arg);
     if (isSlashName(cmd, "doctor")) return try handleDoctorCommand(self);
+    if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
 
     return null;
+}
+
+fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const sub = firstToken(arg);
+
+    if (std.mem.eql(u8, sub, "reindex")) {
+        const rt: ?*memory_mod.MemoryRuntime = if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
+        if (rt) |mem_rt| {
+            const count = mem_rt.reindex(self.allocator);
+            return try std.fmt.allocPrint(self.allocator, "Reindex complete: {d} entries reindexed.", .{count});
+        }
+        return try self.allocator.dupe(u8, "Memory runtime not available. Cannot reindex.");
+    }
+
+    if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "status")) {
+        return try handleDoctorCommand(self);
+    }
+
+    if (std.mem.eql(u8, sub, "stats")) {
+        const rt: ?*memory_mod.MemoryRuntime = if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
+        if (rt) |mem_rt| {
+            const r = mem_rt.resolved;
+            return try std.fmt.allocPrint(self.allocator,
+                "Memory resolved config:\n  backend: {s}\n  retrieval: {s}\n  vector: {s}\n  embedding: {s}\n  rollout: {s}\n  sync: {s}\n  sources: {d}\n  fallback: {s}",
+                .{ r.primary_backend, r.retrieval_mode, r.vector_mode, r.embedding_provider, r.rollout_mode, r.vector_sync_mode, r.source_count, r.fallback_policy },
+            );
+        }
+        return try self.allocator.dupe(u8, "Memory runtime not available.");
+    }
+
+    return try self.allocator.dupe(u8, "Usage: /memory <reindex|doctor|stats>");
 }

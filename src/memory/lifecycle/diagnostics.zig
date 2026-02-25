@@ -56,10 +56,9 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
     const entry_count: usize = rt.memory.count() catch 0;
 
     // Vector plane
-    const vector_store_active = rt._vector_store_impl != null;
-    const vector_entry_count: ?usize = if (rt._vector_store_impl) |vs| blk: {
-        const iface = vs.store();
-        break :blk iface.count() catch null;
+    const vector_store_active = rt._vector_store != null;
+    const vector_entry_count: ?usize = if (rt._vector_store) |vs| blk: {
+        break :blk vs.count() catch null;
     } else null;
 
     // Outbox
@@ -209,6 +208,22 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
 
 const testing = std.testing;
 
+const test_resolved: root.ResolvedConfig = .{
+    .primary_backend = "test",
+    .retrieval_mode = "keyword",
+    .vector_mode = "none",
+    .embedding_provider = "none",
+    .rollout_mode = "off",
+    .vector_sync_mode = "best_effort",
+    .hygiene_enabled = false,
+    .snapshot_enabled = false,
+    .cache_enabled = false,
+    .semantic_cache_enabled = false,
+    .summarizer_enabled = false,
+    .source_count = 0,
+    .fallback_policy = "degrade",
+};
+
 fn makeTestRuntime(allocator: std.mem.Allocator) !struct { rt: root.MemoryRuntime, mem_impl: *root.NoneMemory } {
     const impl_ = try allocator.create(root.NoneMemory);
     impl_.* = root.NoneMemory.init();
@@ -224,6 +239,7 @@ fn makeTestRuntime(allocator: std.mem.Allocator) !struct { rt: root.MemoryRuntim
                 .supports_transactions = false,
                 .supports_outbox = false,
             },
+            .resolved = test_resolved,
             ._db_path = null,
             ._cache_db_path = null,
             ._engine = null,
@@ -276,6 +292,7 @@ test "diagnose with sqlite backend and entries" {
             .supports_transactions = true,
             .supports_outbox = true,
         },
+        .resolved = test_resolved,
         ._db_path = null,
         ._cache_db_path = null,
         ._engine = null,
@@ -331,7 +348,7 @@ test "diagnose with vector store" {
 
     const vs = try allocator.create(vector_store_mod.SqliteSharedVectorStore);
     vs.* = vector_store_mod.SqliteSharedVectorStore.init(allocator, sqlite_impl.db);
-    vs.owns_self = false; // MemoryRuntime.deinit() handles destroy
+    vs.owns_self = true; // vtable deinit will destroy
 
     // Upsert a vector
     const vs_iface = vs.store();
@@ -347,11 +364,12 @@ test "diagnose with vector store" {
             .supports_transactions = true,
             .supports_outbox = true,
         },
+        .resolved = test_resolved,
         ._db_path = null,
         ._cache_db_path = null,
         ._engine = null,
         ._allocator = allocator,
-        ._vector_store_impl = vs,
+        ._vector_store = vs_iface,
     };
     defer rt.deinit();
 
@@ -387,6 +405,7 @@ test "diagnose with outbox" {
             .supports_transactions = true,
             .supports_outbox = true,
         },
+        .resolved = test_resolved,
         ._db_path = null,
         ._cache_db_path = null,
         ._engine = null,

@@ -12,6 +12,7 @@ const memory_lru = @import("memory_lru.zig");
 const pg = if (build_options.enable_postgres) @import("postgres.zig") else struct {};
 const redis_engine = @import("redis.zig");
 const lancedb_engine = @import("lancedb.zig");
+const api_engine = @import("api.zig");
 
 // ── Capability & descriptor types ────────────────────────────────
 
@@ -38,6 +39,7 @@ pub const BackendConfig = struct {
     postgres_url: ?[*:0]const u8 = null,
     postgres_schema: []const u8 = "public",
     postgres_table: []const u8 = "memories",
+    api_config: ?config_types.MemoryApiConfig = null,
 };
 
 pub const BackendInstance = struct {
@@ -103,6 +105,15 @@ const base_backends = [_]BackendDescriptor{
         .create = &createLanceDb,
     },
     .{
+        .name = "api",
+        .label = "HTTP API — delegate to external REST service",
+        .auto_save_default = true,
+        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = true, .supports_transactions = false, .supports_outbox = false },
+        .needs_db_path = false,
+        .needs_workspace = false,
+        .create = &createApi,
+    },
+    .{
         .name = "none",
         .label = "None — disable persistent memory",
         .auto_save_default = false,
@@ -141,6 +152,7 @@ pub fn resolvePaths(
     desc: *const BackendDescriptor,
     workspace_dir: []const u8,
     postgres_cfg: ?config_types.MemoryPostgresConfig,
+    api_cfg: ?config_types.MemoryApiConfig,
 ) !BackendConfig {
     const db_path: ?[*:0]const u8 = if (desc.needs_db_path)
         try std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
@@ -164,6 +176,7 @@ pub fn resolvePaths(
         .postgres_url = pg_url,
         .postgres_schema = pg_schema,
         .postgres_table = pg_table,
+        .api_config = api_cfg,
     };
 }
 
@@ -216,6 +229,15 @@ fn createLanceDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInsta
     return .{ .memory = impl_.memory(), .session_store = null };
 }
 
+fn createApi(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
+    const api_cfg = cfg.api_config orelse return error.MissingApiConfig;
+    const impl_ = try allocator.create(api_engine.ApiMemory);
+    errdefer allocator.destroy(impl_);
+    impl_.* = try api_engine.ApiMemory.init(allocator, api_cfg);
+    impl_.owns_self = true;
+    return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
+}
+
 fn createNone(allocator: std.mem.Allocator, _: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(root.NoneMemory);
     impl_.* = root.NoneMemory.init();
@@ -236,7 +258,7 @@ fn createPostgres(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInst
 // ── Tests ────────────────────────────────────────────────────────
 
 test "registry length" {
-    const expected: usize = if (build_options.enable_postgres) 8 else 7;
+    const expected: usize = if (build_options.enable_postgres) 9 else 8;
     try std.testing.expectEqual(expected, all.len);
 }
 
@@ -301,6 +323,18 @@ test "findBackend lancedb" {
     try std.testing.expect(desc.auto_save_default);
 }
 
+test "findBackend api" {
+    const desc = findBackend("api") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("api", desc.name);
+    try std.testing.expect(!desc.capabilities.supports_keyword_rank);
+    try std.testing.expect(desc.capabilities.supports_session_store);
+    try std.testing.expect(!desc.capabilities.supports_transactions);
+    try std.testing.expect(!desc.capabilities.supports_outbox);
+    try std.testing.expect(!desc.needs_db_path);
+    try std.testing.expect(!desc.needs_workspace);
+    try std.testing.expect(desc.auto_save_default);
+}
+
 test "findBackend unknown returns null" {
     try std.testing.expect(findBackend("nonexistent") == null);
 }
@@ -311,7 +345,7 @@ test "findBackend empty returns null" {
 
 test "resolvePaths sqlite has db_path" {
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null);
     defer if (cfg.db_path) |p| std.testing.allocator.free(std.mem.span(p));
 
     try std.testing.expect(cfg.db_path != null);
@@ -322,7 +356,7 @@ test "resolvePaths sqlite has db_path" {
 
 test "resolvePaths markdown has no db_path" {
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -330,7 +364,7 @@ test "resolvePaths markdown has no db_path" {
 
 test "resolvePaths none has no db_path" {
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);

@@ -7,8 +7,10 @@ const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 
 /// Memory forget tool — lets the agent delete a memory entry.
+/// When a MemoryRuntime is available, also cleans up the vector store.
 pub const MemoryForgetTool = struct {
     memory: ?Memory = null,
+    mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_forget";
     pub const tool_description = "Remove a memory by key. Use to delete outdated facts or sensitive data.";
@@ -40,6 +42,10 @@ pub const MemoryForgetTool = struct {
         };
 
         if (forgotten) {
+            // Best-effort vector store cleanup
+            if (self.mem_rt) |rt| {
+                rt.deleteFromVectorStore(key);
+            }
             const msg = try std.fmt.allocPrint(allocator, "Forgot memory: {s}", .{key});
             return ToolResult{ .success = true, .output = msg };
         } else {

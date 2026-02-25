@@ -2,6 +2,7 @@ const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const MemoryEntry = memory_mod.MemoryEntry;
+const MemoryRuntime = memory_mod.MemoryRuntime;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Memory Loader — inject relevant memory context into user messages
@@ -89,6 +90,35 @@ pub fn loadContext(
     return try buf.toOwnedSlice(allocator);
 }
 
+/// Load context using the full retrieval pipeline (hybrid search, RRF, etc.)
+/// when a MemoryRuntime is available.
+pub fn loadContextWithRuntime(
+    allocator: std.mem.Allocator,
+    rt: *MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ![]const u8 {
+    const candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
+        return try allocator.dupe(u8, "");
+    };
+    defer memory_mod.retrieval.freeCandidates(allocator, candidates);
+
+    if (candidates.len == 0) return try allocator.dupe(u8, "");
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("[Memory context]\n");
+
+    for (candidates) |cand| {
+        try std.fmt.format(w, "- {s}: {s}\n", .{ cand.key, cand.snippet });
+    }
+    try w.writeAll("\n");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// Enrich a user message with memory context prepended.
 /// If no context is available, returns an owned dupe of the original message.
 pub fn enrichMessage(
@@ -98,6 +128,28 @@ pub fn enrichMessage(
     session_id: ?[]const u8,
 ) ![]const u8 {
     const context = try loadContext(allocator, mem, user_message, session_id);
+    if (context.len == 0) {
+        allocator.free(context);
+        return try allocator.dupe(u8, user_message);
+    }
+
+    defer allocator.free(context);
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
+}
+
+/// Enrich a user message using the retrieval engine if available, else raw recall.
+pub fn enrichMessageWithRuntime(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ![]const u8 {
+    const context = if (mem_rt) |rt|
+        try loadContextWithRuntime(allocator, rt, user_message, session_id)
+    else
+        try loadContext(allocator, mem, user_message, session_id);
+
     if (context.len == 0) {
         allocator.free(context);
         return try allocator.dupe(u8, user_message);

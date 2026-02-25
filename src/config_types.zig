@@ -465,8 +465,46 @@ pub const MemoryConfig = struct {
     reliability: MemoryReliabilityConfig = .{},
     postgres: MemoryPostgresConfig = .{},
     redis: MemoryRedisConfig = .{},
+    api: MemoryApiConfig = .{},
     retrieval_stages: MemoryRetrievalStagesConfig = .{},
     summarizer: MemorySummarizerConfig = .{},
+
+    /// Apply profile defaults. Only sets fields that are still at their default values,
+    /// so explicit user overrides always win (profile is applied AFTER parsing).
+    pub fn applyProfileDefaults(self: *MemoryConfig) void {
+        const p = MemoryProfile.fromString(self.profile);
+        switch (p) {
+            .local_keyword => {
+                // Defaults already match local_keyword — no changes needed.
+            },
+            .markdown_only => {
+                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "markdown";
+            },
+            .postgres_keyword => {
+                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "postgres";
+            },
+            .local_hybrid => {
+                // SQLite + vector hybrid
+                if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+            },
+            .postgres_hybrid => {
+                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "postgres";
+                if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+            },
+            .minimal_none => {
+                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "none";
+                self.auto_save = false;
+            },
+            .custom => {
+                // No defaults applied — user controls everything.
+            },
+        }
+    }
 };
 
 pub const MemorySearchConfig = struct {
@@ -606,6 +644,10 @@ pub const MemoryReliabilityConfig = struct {
     circuit_breaker_cooldown_ms: u32 = 30_000,
     shadow_hybrid_percent: u32 = 0,
     canary_hybrid_percent: u32 = 0,
+    /// Fallback policy when optional subsystems (vector plane, cache) fail to init.
+    /// "degrade" (default): silently disable the failed subsystem, log a warning.
+    /// "fail_fast": return null from initRuntime, preventing startup.
+    fallback_policy: []const u8 = "degrade",
 };
 
 pub const MemoryPostgresConfig = struct {
@@ -622,6 +664,13 @@ pub const MemoryRedisConfig = struct {
     db_index: u8 = 0,
     key_prefix: []const u8 = "nullclaw",
     ttl_seconds: u32 = 0, // 0 = no expiry
+};
+
+pub const MemoryApiConfig = struct {
+    url: []const u8 = "",
+    api_key: []const u8 = "",
+    timeout_ms: u32 = 10_000,
+    namespace: []const u8 = "",
 };
 
 pub const MemoryRetrievalStagesConfig = struct {

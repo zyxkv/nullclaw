@@ -21,6 +21,7 @@ pub const lucid = @import("engines/lucid.zig");
 pub const postgres = if (build_options.enable_postgres) @import("engines/postgres.zig") else struct {};
 pub const redis = @import("engines/redis.zig");
 pub const lancedb = @import("engines/lancedb.zig");
+pub const api = @import("engines/api.zig");
 pub const registry = @import("engines/registry.zig");
 
 // retrieval/ (Layer B: Retrieval Engine)
@@ -65,6 +66,7 @@ pub const LucidMemory = lucid.LucidMemory;
 pub const PostgresMemory = if (build_options.enable_postgres) postgres.PostgresMemory else struct {};
 pub const RedisMemory = redis.RedisMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
+pub const ApiMemory = api.ApiMemory;
 pub const ResponseCache = cache.ResponseCache;
 pub const Chunk = chunker.Chunk;
 pub const chunkMarkdown = chunker.chunkMarkdown;
@@ -93,6 +95,7 @@ pub const VectorStore = vector_store.VectorStore;
 pub const VectorResult = vector_store.VectorResult;
 pub const HealthStatus = vector_store.HealthStatus;
 pub const SqliteSharedVectorStore = vector_store.SqliteSharedVectorStore;
+pub const SqliteSidecarVectorStore = vector_store.SqliteSidecarVectorStore;
 pub const QdrantVectorStore = store_qdrant.QdrantVectorStore;
 pub const freeVectorResults = vector_store.freeVectorResults;
 pub const VectorOutbox = outbox.VectorOutbox;
@@ -308,170 +311,32 @@ pub const Memory = struct {
     }
 };
 
-// ── Backend kind classification ────────────────────────────────────
-
-pub const MemoryBackendKind = enum {
-    sqlite_backend,
-    markdown_backend,
-    none_backend,
-    memory_lru_backend,
-    lucid_backend,
-    postgres_backend,
-    redis_backend,
-    lancedb_backend,
-    unknown,
-};
-
-pub const MemoryBackendProfile = struct {
-    key: []const u8,
-    label: []const u8,
-    auto_save_default: bool,
-    uses_sqlite_hygiene: bool,
-    sqlite_based: bool,
-};
-
-pub fn classifyBackend(backend_name: []const u8) MemoryBackendKind {
-    if (std.mem.eql(u8, backend_name, "sqlite")) return .sqlite_backend;
-    if (std.mem.eql(u8, backend_name, "markdown")) return .markdown_backend;
-    if (std.mem.eql(u8, backend_name, "none")) return .none_backend;
-    if (std.mem.eql(u8, backend_name, "memory")) return .memory_lru_backend;
-    if (std.mem.eql(u8, backend_name, "lucid")) return .lucid_backend;
-    if (std.mem.eql(u8, backend_name, "postgres")) return .postgres_backend;
-    if (std.mem.eql(u8, backend_name, "redis")) return .redis_backend;
-    if (std.mem.eql(u8, backend_name, "lancedb")) return .lancedb_backend;
-    return .unknown;
-}
-
-pub fn defaultBackendKey() []const u8 {
-    return "sqlite";
-}
-
-const base_selectable = [_]MemoryBackendProfile{
-    .{
-        .key = "sqlite",
-        .label = "SQLite with FTS5 search (recommended)",
-        .auto_save_default = true,
-        .uses_sqlite_hygiene = true,
-        .sqlite_based = true,
-    },
-    .{
-        .key = "markdown",
-        .label = "Markdown files — simple, human-readable",
-        .auto_save_default = true,
-        .uses_sqlite_hygiene = false,
-        .sqlite_based = false,
-    },
-    .{
-        .key = "lucid",
-        .label = "Lucid — SQLite + cross-project memory sync via lucid CLI",
-        .auto_save_default = true,
-        .uses_sqlite_hygiene = true,
-        .sqlite_based = true,
-    },
-    .{
-        .key = "redis",
-        .label = "Redis — distributed in-memory store with optional TTL",
-        .auto_save_default = true,
-        .uses_sqlite_hygiene = false,
-        .sqlite_based = false,
-    },
-    .{
-        .key = "lancedb",
-        .label = "LanceDB — vector-augmented SQLite with duplicate detection",
-        .auto_save_default = true,
-        .uses_sqlite_hygiene = false,
-        .sqlite_based = true,
-    },
-    .{
-        .key = "none",
-        .label = "None — disable persistent memory",
-        .auto_save_default = false,
-        .uses_sqlite_hygiene = false,
-        .sqlite_based = false,
-    },
-};
-
-const pg_selectable = if (build_options.enable_postgres) [_]MemoryBackendProfile{.{
-    .key = "postgres",
-    .label = "PostgreSQL — remote/shared memory store",
-    .auto_save_default = true,
-    .uses_sqlite_hygiene = false,
-    .sqlite_based = false,
-}} else [0]MemoryBackendProfile{};
-
-pub const selectable_backends = base_selectable ++ pg_selectable;
-
-// ── Factory ────────────────────────────────────────────────────────
-
-pub const CreateError = error{
-    SqliteOpenFailed,
-    MigrationFailed,
-    PrepareFailed,
-    StepFailed,
-    MarkdownInitFailed,
-    InvalidBackend,
-};
-
-/// Create a memory backend by name. Caller owns the returned Memory and must call deinit().
-/// For sqlite, pass the db_path (e.g. ":memory:" for tests, or a file path).
-/// For markdown, pass workspace_dir as the path.
-/// For none, path is ignored.
-pub fn createMemory(allocator: std.mem.Allocator, backend_name: []const u8, path: [*:0]const u8) !Memory {
-    const kind = classifyBackend(backend_name);
-    return switch (kind) {
-        .sqlite_backend => {
-            const impl_ = try allocator.create(SqliteMemory);
-            errdefer allocator.destroy(impl_);
-            impl_.* = try SqliteMemory.init(allocator, path);
-            impl_.owns_self = true;
-            return impl_.memory();
-        },
-        .markdown_backend => {
-            const impl_ = try allocator.create(MarkdownMemory);
-            errdefer allocator.destroy(impl_);
-            impl_.* = try MarkdownMemory.init(allocator, std.mem.span(path));
-            impl_.owns_self = true;
-            return impl_.memory();
-        },
-        .lucid_backend => {
-            const impl_ = try allocator.create(LucidMemory);
-            errdefer allocator.destroy(impl_);
-            impl_.* = try LucidMemory.init(allocator, path, std.mem.span(path));
-            impl_.owns_self = true;
-            return impl_.memory();
-        },
-        .none_backend => {
-            const impl_ = try allocator.create(NoneMemory);
-            impl_.* = NoneMemory.init();
-            impl_.allocator = allocator;
-            return impl_.memory();
-        },
-        .memory_lru_backend => {
-            const impl_ = try allocator.create(InMemoryLruMemory);
-            impl_.* = InMemoryLruMemory.init(allocator, 1000);
-            impl_.owns_self = true;
-            return impl_.memory();
-        },
-        .lancedb_backend => {
-            const impl_ = try allocator.create(LanceDbMemory);
-            errdefer allocator.destroy(impl_);
-            impl_.* = try LanceDbMemory.init(allocator, path, null, .{});
-            impl_.owns_self = true;
-            return impl_.memory();
-        },
-        .postgres_backend => return error.InvalidBackend, // postgres requires initRuntime with config
-        .redis_backend => return error.InvalidBackend, // redis requires initRuntime with config
-        .unknown => return error.InvalidBackend,
-    };
-}
-
 // ── MemoryRuntime — bundled memory + session store + capabilities ──
+
+/// Resolved configuration snapshot — captures what was actually resolved during init.
+/// Stored in MemoryRuntime for diagnostics, `/doctor`, and runtime inspection.
+pub const ResolvedConfig = struct {
+    primary_backend: []const u8,
+    retrieval_mode: []const u8, // "keyword" | "hybrid"
+    vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "qdrant" | "pgvector"
+    embedding_provider: []const u8, // "none" | "openai" | "gemini" | "voyage" | "ollama" | "auto"
+    rollout_mode: []const u8,
+    vector_sync_mode: []const u8, // "best_effort" | "durable_outbox"
+    hygiene_enabled: bool,
+    snapshot_enabled: bool,
+    cache_enabled: bool,
+    semantic_cache_enabled: bool,
+    summarizer_enabled: bool,
+    source_count: usize,
+    fallback_policy: []const u8, // "degrade" | "fail_fast"
+};
 
 pub const MemoryRuntime = struct {
     memory: Memory,
     session_store: ?SessionStore,
     response_cache: ?*cache.ResponseCache,
     capabilities: BackendCapabilities,
+    resolved: ResolvedConfig,
 
     // Internal: owned resources for cleanup
     _db_path: ?[*:0]const u8,
@@ -490,7 +355,8 @@ pub const MemoryRuntime = struct {
 
     // P3: vector plane components (all optional)
     _embedding_provider: ?embeddings.EmbeddingProvider = null,
-    _vector_store_impl: ?*vector_store.SqliteSharedVectorStore = null,
+    _vector_store: ?vector_store.VectorStore = null,
+    _vector_store_deinit: ?*const fn () void = null,
     _circuit_breaker: ?*circuit_breaker.CircuitBreaker = null,
     _outbox: ?*outbox.VectorOutbox = null,
 
@@ -545,8 +411,7 @@ pub const MemoryRuntime = struct {
     /// Errors are caught and logged, never propagated.
     pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
         const provider = self._embedding_provider orelse return;
-        const vs_impl = self._vector_store_impl orelse return;
-        const vs = vs_impl.store();
+        const vs = self._vector_store orelse return;
 
         // Check circuit breaker
         if (self._circuit_breaker) |cb| {
@@ -573,9 +438,52 @@ pub const MemoryRuntime = struct {
     pub fn drainOutbox(self: *MemoryRuntime, allocator: std.mem.Allocator) u32 {
         const ob = self._outbox orelse return 0;
         const provider = self._embedding_provider orelse return 0;
-        const vs_impl = self._vector_store_impl orelse return 0;
-        const vs = vs_impl.store();
+        const vs = self._vector_store orelse return 0;
         return ob.drain(allocator, provider, vs, self._circuit_breaker) catch 0;
+    }
+
+    /// Best-effort delete from vector store after a forget() call.
+    /// Errors are caught and logged, never propagated.
+    pub fn deleteFromVectorStore(self: *MemoryRuntime, key: []const u8) void {
+        const vs = self._vector_store orelse return;
+        vs.delete(key) catch |err| {
+            log.warn("vector store delete failed for key '{s}': {}", .{ key, err });
+        };
+    }
+
+    /// Rebuild the entire vector store from primary memory entries.
+    /// Used for recovery after vector store corruption, embedding model changes,
+    /// or migration to a different vector store backend.
+    /// Returns the number of entries reindexed, or 0 if no vector plane is configured.
+    pub fn reindex(self: *MemoryRuntime, allocator: std.mem.Allocator) u32 {
+        const provider = self._embedding_provider orelse return 0;
+        const vs = self._vector_store orelse return 0;
+
+        // List all entries from primary store
+        const entries = self.memory.list(allocator, null, null) catch |err| {
+            log.warn("reindex: failed to list primary entries: {}", .{err});
+            return 0;
+        };
+        defer freeEntries(allocator, entries);
+
+        var reindexed: u32 = 0;
+        for (entries) |entry| {
+            const emb = provider.embed(allocator, entry.content) catch |err| {
+                log.warn("reindex: embed failed for key '{s}': {}", .{ entry.key, err });
+                continue;
+            };
+            defer allocator.free(emb);
+            if (emb.len == 0) continue;
+
+            vs.upsert(entry.key, emb) catch |err| {
+                log.warn("reindex: upsert failed for key '{s}': {}", .{ entry.key, err });
+                continue;
+            };
+            reindexed += 1;
+        }
+
+        log.info("reindex complete: {d}/{d} entries reindexed", .{ reindexed, entries.len });
+        return reindexed;
     }
 
     /// Enqueue a key for vector sync via the outbox (if configured).
@@ -610,9 +518,8 @@ pub const MemoryRuntime = struct {
         if (self._circuit_breaker) |cb| {
             self._allocator.destroy(cb);
         }
-        if (self._vector_store_impl) |vs| {
-            vs.deinit();
-            self._allocator.destroy(vs);
+        if (self._vector_store) |vs| {
+            vs.deinitStore(); // vtable deinit handles owns_self destroy
         }
         if (self._embedding_provider) |ep| {
             ep.deinit();
@@ -645,12 +552,20 @@ pub fn initRuntime(
     config: *const config_types.MemoryConfig,
     workspace_dir: []const u8,
 ) ?MemoryRuntime {
-    const desc = registry.findBackend(config.backend) orelse return null;
+    const desc = registry.findBackend(config.backend) orelse {
+        log.warn("unknown memory backend '{s}' — check config.memory.backend", .{config.backend});
+        return null;
+    };
 
     const pg_cfg: ?config_types.MemoryPostgresConfig = if (std.mem.eql(u8, config.backend, "postgres")) config.postgres else null;
-    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg) catch return null;
+    const api_cfg: ?config_types.MemoryApiConfig = if (std.mem.eql(u8, config.backend, "api")) config.api else null;
+    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, api_cfg) catch |err| {
+        log.warn("memory path resolution failed for backend '{s}': {}", .{ config.backend, err });
+        return null;
+    };
 
-    const instance = desc.create(allocator, cfg) catch {
+    const instance = desc.create(allocator, cfg) catch |err| {
+        log.warn("memory backend '{s}' init failed: {}", .{ config.backend, err });
         if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
         if (cfg.db_path) |p| allocator.free(std.mem.span(p));
         return null;
@@ -743,31 +658,132 @@ pub fn initRuntime(
 
     // ── P3: Vector plane wiring ──
     var embed_provider: ?embeddings.EmbeddingProvider = null;
-    var vs_impl: ?*vector_store.SqliteSharedVectorStore = null;
+    var vs_iface: ?vector_store.VectorStore = null;
     var cb_inst: ?*circuit_breaker.CircuitBreaker = null;
     var outbox_inst: ?*outbox.VectorOutbox = null;
 
     if (!std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
-        // 1. Create EmbeddingProvider
-        const ep = embeddings.createEmbeddingProvider(
+        // 1. Create EmbeddingProvider (with optional fallback via ProviderRouter)
+        const primary_ep = embeddings.createEmbeddingProvider(
             allocator,
             config.search.provider,
             null,
             config.search.model,
             config.search.dimensions,
         ) catch break :vec_plane;
-        embed_provider = ep;
 
-        // 2. Extract sqlite db handle
-        const db_handle = extractSqliteDb(instance.memory) orelse break :vec_plane;
+        embed_provider = primary_ep;
 
-        // 3. Create SqliteSharedVectorStore
-        const vs = allocator.create(vector_store.SqliteSharedVectorStore) catch break :vec_plane;
-        vs.* = vector_store.SqliteSharedVectorStore.init(allocator, db_handle);
-        vs.owns_self = true;
-        vs_impl = vs;
+        // Wrap primary + fallback in a ProviderRouter when fallback is configured
+        if (!std.mem.eql(u8, config.search.fallback_provider, "none") and
+            config.search.fallback_provider.len > 0) wrap_router: {
+            const fallback_ep = embeddings.createEmbeddingProvider(
+                allocator,
+                config.search.fallback_provider,
+                null,
+                config.search.model,
+                config.search.dimensions,
+            ) catch {
+                log.warn("fallback embedding provider '{s}' init failed, using primary only", .{config.search.fallback_provider});
+                break :wrap_router;
+            };
+            const router = provider_router.ProviderRouter.init(
+                allocator,
+                primary_ep,
+                &.{fallback_ep},
+                &.{},
+            ) catch {
+                fallback_ep.deinit();
+                break :wrap_router;
+            };
+            embed_provider = router.provider();
+        }
 
-        // 4. Create CircuitBreaker
+        // 2. Resolve vector store mode based on config.search.store.kind
+        //    "auto"           → sqlite_shared if primary is sqlite-based, else sqlite_sidecar
+        //    "qdrant"         → QdrantVectorStore via REST API
+        //    "pgvector"       → PgvectorVectorStore via libpq (requires enable_postgres)
+        //    "sqlite_shared"  → explicit sqlite shared (requires sqlite-based primary)
+        //    "sqlite_sidecar" → explicit sqlite sidecar (separate vectors.db)
+        var db_handle_for_outbox: ?*c.sqlite3 = null;
+        const store_kind = config.search.store.kind;
+
+        if (std.mem.eql(u8, store_kind, "qdrant")) {
+            // Qdrant via REST API
+            if (config.search.store.qdrant_url.len == 0) {
+                log.warn("vector store kind 'qdrant' requires search.store.qdrant_url to be set", .{});
+                break :vec_plane;
+            }
+            const qdrant = store_qdrant.QdrantVectorStore.init(allocator, .{
+                .url = config.search.store.qdrant_url,
+                .api_key = if (config.search.store.qdrant_api_key.len > 0) config.search.store.qdrant_api_key else null,
+                .collection_name = config.search.store.qdrant_collection,
+                .dimensions = config.search.dimensions,
+            }) catch |err| {
+                log.warn("qdrant vector store init failed: {}", .{err});
+                break :vec_plane;
+            };
+            vs_iface = qdrant.store();
+        } else if (std.mem.eql(u8, store_kind, "pgvector")) {
+            // pgvector via PostgreSQL
+            if (build_options.enable_postgres) {
+                const pg_url = if (config.postgres.connection_url.len > 0)
+                    config.postgres.connection_url
+                else {
+                    log.warn("vector store kind 'pgvector' requires postgres.connection_url to be set", .{});
+                    break :vec_plane;
+                };
+                const pgvs = store_pgvector.PgvectorVectorStore.init(allocator, .{
+                    .connection_url = pg_url,
+                    .table_name = config.search.store.pgvector_table,
+                    .dimensions = config.search.dimensions,
+                }) catch |err| {
+                    log.warn("pgvector vector store init failed: {}", .{err});
+                    break :vec_plane;
+                };
+                vs_iface = pgvs.store();
+            } else {
+                log.warn("vector store kind 'pgvector' requires build with enable_postgres=true", .{});
+                break :vec_plane;
+            }
+        } else {
+            // auto / sqlite_shared / sqlite_sidecar
+            const use_shared = std.mem.eql(u8, store_kind, "auto") or std.mem.eql(u8, store_kind, "sqlite_shared");
+            if (use_shared) {
+                if (extractSqliteDb(instance.memory)) |db_handle| {
+                    // sqlite_shared: reuse existing sqlite db handle
+                    const vs = allocator.create(vector_store.SqliteSharedVectorStore) catch break :vec_plane;
+                    vs.* = vector_store.SqliteSharedVectorStore.init(allocator, db_handle);
+                    vs.owns_self = true;
+                    vs_iface = vs.store();
+                    db_handle_for_outbox = db_handle;
+                } else if (std.mem.eql(u8, store_kind, "sqlite_shared")) {
+                    log.warn("vector store kind 'sqlite_shared' requires a sqlite-based primary backend", .{});
+                    break :vec_plane;
+                }
+                // else: auto fallthrough to sidecar below
+            }
+
+            // sqlite_sidecar: explicit or auto fallback for non-sqlite backends
+            if (vs_iface == null) {
+                const sidecar_path_slice = std.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
+                const sidecar_path: [*:0]const u8 = sidecar_path_slice.ptr;
+                const vs = allocator.create(vector_store.SqliteSidecarVectorStore) catch {
+                    allocator.free(sidecar_path_slice);
+                    break :vec_plane;
+                };
+                vs.* = vector_store.SqliteSidecarVectorStore.init(allocator, sidecar_path) catch {
+                    allocator.destroy(vs);
+                    allocator.free(sidecar_path_slice);
+                    break :vec_plane;
+                };
+                vs.owns_self = true;
+                vs_iface = vs.store();
+                db_handle_for_outbox = vs.db; // sidecar's own db for outbox
+            }
+        }
+
+        // 3. Create CircuitBreaker
         const cb = allocator.create(circuit_breaker.CircuitBreaker) catch break :vec_plane;
         cb.* = circuit_breaker.CircuitBreaker.init(
             config.reliability.circuit_breaker_failures,
@@ -775,22 +791,37 @@ pub fn initRuntime(
         );
         cb_inst = cb;
 
-        // 5. Create VectorOutbox if not best_effort
+        // 4. Create VectorOutbox if not best_effort
         if (!std.mem.eql(u8, config.search.sync.mode, "best_effort")) {
-            const ob = allocator.create(outbox.VectorOutbox) catch break :vec_plane;
-            ob.* = outbox.VectorOutbox.init(allocator, db_handle, config.search.sync.embed_max_retries);
-            ob.owns_self = true;
-            ob.migrate() catch {
-                allocator.destroy(ob);
-                break :vec_plane;
-            };
-            outbox_inst = ob;
+            if (db_handle_for_outbox) |db_h| {
+                const ob = allocator.create(outbox.VectorOutbox) catch break :vec_plane;
+                ob.* = outbox.VectorOutbox.init(allocator, db_h, config.search.sync.embed_max_retries);
+                ob.owns_self = true;
+                ob.migrate() catch {
+                    allocator.destroy(ob);
+                    break :vec_plane;
+                };
+                outbox_inst = ob;
+            }
         }
 
-        // 6. Wire into retrieval engine
+        // 5. Wire into retrieval engine
         if (engine) |eng| {
-            const vs_iface = vs.store();
-            eng.setVectorSearch(ep, vs_iface, cb, config.search.query.hybrid);
+            eng.setVectorSearch(embed_provider.?, vs_iface.?, cb, config.search.query.hybrid);
+        }
+    }
+
+    // Enforce fallback_policy: if fail_fast and vector plane was expected but failed, abort.
+    if (std.mem.eql(u8, config.reliability.fallback_policy, "fail_fast")) {
+        if (!std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled and vs_iface == null) {
+            log.warn("fallback_policy=fail_fast: vector plane init failed, aborting runtime creation", .{});
+            if (engine) |eng| {
+                eng.deinit();
+                allocator.destroy(eng);
+            }
+            instance.memory.deinit();
+            if (cfg.db_path) |p| allocator.free(std.mem.span(p));
+            return null;
         }
     }
 
@@ -830,7 +861,16 @@ pub fn initRuntime(
 
     // ── Startup diagnostic ──
     const source_count: usize = if (engine) |eng| eng.sources.items.len else 0;
-    const vector_mode: []const u8 = if (vs_impl != null) "sqlite_shared" else "none";
+    const vector_mode: []const u8 = if (vs_iface == null)
+        "none"
+    else if (std.mem.eql(u8, config.search.store.kind, "qdrant"))
+        "qdrant"
+    else if (std.mem.eql(u8, config.search.store.kind, "pgvector"))
+        "pgvector"
+    else if (extractSqliteDb(instance.memory) != null)
+        "sqlite_shared"
+    else
+        "sqlite_sidecar";
     log.info("memory plan resolved: backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
         config.backend,
         if (config.search.query.hybrid.enabled) "hybrid" else "keyword",
@@ -844,11 +884,28 @@ pub fn initRuntime(
         source_count,
     });
 
+    const embed_name: []const u8 = if (embed_provider) |ep_| ep_.getName() else "none";
+
     return .{
         .memory = instance.memory,
         .session_store = instance.session_store,
         .response_cache = resp_cache,
         .capabilities = desc.capabilities,
+        .resolved = .{
+            .primary_backend = config.backend,
+            .retrieval_mode = if (config.search.query.hybrid.enabled) "hybrid" else "keyword",
+            .vector_mode = vector_mode,
+            .embedding_provider = embed_name,
+            .rollout_mode = config.reliability.rollout_mode,
+            .vector_sync_mode = config.search.sync.mode,
+            .hygiene_enabled = config.lifecycle.hygiene_enabled,
+            .snapshot_enabled = config.lifecycle.snapshot_enabled,
+            .cache_enabled = config.response_cache.enabled,
+            .semantic_cache_enabled = sem_cache != null,
+            .summarizer_enabled = config.summarizer.enabled,
+            .source_count = source_count,
+            .fallback_policy = config.reliability.fallback_policy,
+        },
         ._db_path = cfg.db_path,
         ._cache_db_path = cache_db_path,
         ._engine = engine,
@@ -857,7 +914,7 @@ pub fn initRuntime(
         ._summarizer_cfg = summarizer_cfg,
         ._semantic_cache = sem_cache,
         ._embedding_provider = embed_provider,
-        ._vector_store_impl = vs_impl,
+        ._vector_store = vs_iface,
         ._circuit_breaker = cb_inst,
         ._outbox = outbox_inst,
     };
@@ -882,6 +939,22 @@ fn extractSqliteDb(mem: Memory) ?*c.sqlite3 {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
+
+const test_resolved_cfg: ResolvedConfig = .{
+    .primary_backend = "test",
+    .retrieval_mode = "keyword",
+    .vector_mode = "none",
+    .embedding_provider = "none",
+    .rollout_mode = "off",
+    .vector_sync_mode = "best_effort",
+    .hygiene_enabled = false,
+    .snapshot_enabled = false,
+    .cache_enabled = false,
+    .semantic_cache_enabled = false,
+    .summarizer_enabled = false,
+    .source_count = 0,
+    .fallback_policy = "degrade",
+};
 
 test "MemoryCategory toString roundtrip" {
     const core: MemoryCategory = .core;
@@ -922,31 +995,6 @@ test "MemoryCategory equality" {
     try std.testing.expect(!c1.eql(c3));
 }
 
-test "classifyBackend" {
-    try std.testing.expect(classifyBackend("sqlite") == .sqlite_backend);
-    try std.testing.expect(classifyBackend("markdown") == .markdown_backend);
-    try std.testing.expect(classifyBackend("none") == .none_backend);
-    try std.testing.expect(classifyBackend("lucid") == .lucid_backend);
-    try std.testing.expect(classifyBackend("postgres") == .postgres_backend);
-    try std.testing.expect(classifyBackend("redis") == .redis_backend);
-    try std.testing.expect(classifyBackend("lancedb") == .lancedb_backend);
-}
-
-test "selectable backends are ordered" {
-    const expected: usize = if (build_options.enable_postgres) 7 else 6;
-    try std.testing.expect(selectable_backends.len == expected);
-    try std.testing.expectEqualStrings("sqlite", selectable_backends[0].key);
-    try std.testing.expectEqualStrings("markdown", selectable_backends[1].key);
-    try std.testing.expectEqualStrings("lucid", selectable_backends[2].key);
-    try std.testing.expectEqualStrings("redis", selectable_backends[3].key);
-    try std.testing.expectEqualStrings("lancedb", selectable_backends[4].key);
-    try std.testing.expectEqualStrings("none", selectable_backends[5].key);
-}
-
-test "defaultBackendKey is sqlite" {
-    try std.testing.expectEqualStrings("sqlite", defaultBackendKey());
-}
-
 test "MemoryCategory custom toString" {
     const cat: MemoryCategory = .{ .custom = "my_project" };
     try std.testing.expectEqualStrings("my_project", cat.toString());
@@ -964,52 +1012,6 @@ test "MemoryCategory eql different tags" {
     try std.testing.expect(!core.eql(daily));
     try std.testing.expect(!core.eql(conv));
     try std.testing.expect(!daily.eql(conv));
-}
-
-test "classifyBackend unknown returns unknown" {
-    try std.testing.expect(classifyBackend("nonexistent") == .unknown);
-    try std.testing.expect(classifyBackend("") == .unknown);
-    try std.testing.expect(classifyBackend("SQLITE") == .unknown);
-}
-
-test "createMemory unknown backend returns InvalidBackend" {
-    const result = createMemory(std.testing.allocator, "nonexistent", "unused");
-    try std.testing.expectError(error.InvalidBackend, result);
-}
-
-test "createMemory redis backend returns InvalidBackend" {
-    const result = createMemory(std.testing.allocator, "redis", "unused");
-    try std.testing.expectError(error.InvalidBackend, result);
-}
-
-test "selectable backends sqlite is recommended" {
-    try std.testing.expect(selectable_backends[0].sqlite_based);
-    try std.testing.expect(selectable_backends[0].uses_sqlite_hygiene);
-    try std.testing.expect(selectable_backends[0].auto_save_default);
-}
-
-test "selectable backends lucid is sqlite based" {
-    try std.testing.expect(selectable_backends[2].auto_save_default);
-    try std.testing.expect(selectable_backends[2].sqlite_based);
-    try std.testing.expect(selectable_backends[2].uses_sqlite_hygiene);
-}
-
-test "selectable backends redis is not sqlite based" {
-    try std.testing.expect(selectable_backends[3].auto_save_default);
-    try std.testing.expect(!selectable_backends[3].sqlite_based);
-    try std.testing.expect(!selectable_backends[3].uses_sqlite_hygiene);
-}
-
-test "selectable backends lancedb is sqlite based" {
-    try std.testing.expect(selectable_backends[4].auto_save_default);
-    try std.testing.expect(selectable_backends[4].sqlite_based);
-    try std.testing.expect(!selectable_backends[4].uses_sqlite_hygiene);
-}
-
-test "selectable backends none has no auto save" {
-    try std.testing.expect(!selectable_backends[5].auto_save_default);
-    try std.testing.expect(!selectable_backends[5].sqlite_based);
-    try std.testing.expect(!selectable_backends[5].uses_sqlite_hygiene);
 }
 
 test "Memory convenience store accepts session_id" {
@@ -1196,12 +1198,13 @@ test "MemoryRuntime.search without engine falls back to recall" {
         .session_store = null,
         .response_cache = null,
         .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
         ._db_path = null,
         ._cache_db_path = null,
         ._engine = null,
         ._allocator = std.testing.allocator,
         ._embedding_provider = null,
-        ._vector_store_impl = null,
+        ._vector_store = null,
         ._circuit_breaker = null,
         ._outbox = null,
     };
@@ -1225,7 +1228,7 @@ test "initRuntime with hybrid disabled has no embedding provider" {
     defer rt.deinit();
 
     try std.testing.expect(rt._embedding_provider == null);
-    try std.testing.expect(rt._vector_store_impl == null);
+    try std.testing.expect(rt._vector_store == null);
     try std.testing.expect(rt._circuit_breaker == null);
     try std.testing.expect(rt._outbox == null);
 }
@@ -1242,7 +1245,7 @@ test "initRuntime with search.provider=none has no vector store" {
     defer rt.deinit();
 
     try std.testing.expect(rt._embedding_provider == null);
-    try std.testing.expect(rt._vector_store_impl == null);
+    try std.testing.expect(rt._vector_store == null);
 }
 
 test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
@@ -1253,12 +1256,13 @@ test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
         .session_store = null,
         .response_cache = null,
         .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
         ._db_path = null,
         ._cache_db_path = null,
         ._engine = null,
         ._allocator = std.testing.allocator,
         ._embedding_provider = null,
-        ._vector_store_impl = null,
+        ._vector_store = null,
         ._circuit_breaker = null,
         ._outbox = null,
     };
@@ -1274,12 +1278,13 @@ test "MemoryRuntime.drainOutbox with no outbox returns 0" {
         .session_store = null,
         .response_cache = null,
         .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
         ._db_path = null,
         ._cache_db_path = null,
         ._engine = null,
         ._allocator = std.testing.allocator,
         ._embedding_provider = null,
-        ._vector_store_impl = null,
+        ._vector_store = null,
         ._circuit_breaker = null,
         ._outbox = null,
     };

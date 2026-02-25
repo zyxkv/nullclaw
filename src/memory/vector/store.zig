@@ -278,6 +278,71 @@ pub const SqliteSharedVectorStore = struct {
     };
 };
 
+// ── Sidecar vector store ──────────────────────────────────────────
+//
+// Opens its OWN SQLite database for vector storage.  Use this when the
+// primary backend is *not* SQLite-based (markdown, postgres, redis, etc.).
+// The sidecar owns the db handle and closes it on deinit.
+
+pub const SqliteSidecarVectorStore = struct {
+    db: ?*c.sqlite3,
+    allocator: Allocator,
+    owns_self: bool = false,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, db_path: [*:0]const u8) !SqliteSidecarVectorStore {
+        var db: ?*c.sqlite3 = null;
+        var rc = c.sqlite3_open(db_path, &db);
+        if (rc != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return error.SqliteOpenFailed;
+        }
+        // Create table (same schema as shared)
+        const create_sql = "CREATE TABLE IF NOT EXISTS memory_embeddings (memory_key TEXT PRIMARY KEY, embedding BLOB NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')))";
+        rc = c.sqlite3_exec(db, create_sql, null, null, null);
+        if (rc != c.SQLITE_OK) {
+            _ = c.sqlite3_close(db);
+            return error.MigrationFailed;
+        }
+        return .{
+            .db = db,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn store(self: *SqliteSidecarVectorStore) VectorStore {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &sidecar_vtable,
+        };
+    }
+
+    pub fn deinit(self: *SqliteSidecarVectorStore) void {
+        if (self.db) |d| _ = c.sqlite3_close(d);
+        self.db = null;
+        if (self.owns_self) {
+            self.allocator.destroy(self);
+        }
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    // Reuse shared vtable methods (same db schema, same struct layout).
+    // Only deinit differs: sidecar closes its own db handle.
+    const sidecar_vtable = VectorStore.VTable{
+        .upsert = SqliteSharedVectorStore.vtable_instance.upsert,
+        .search = SqliteSharedVectorStore.vtable_instance.search,
+        .delete = SqliteSharedVectorStore.vtable_instance.delete,
+        .count = SqliteSharedVectorStore.vtable_instance.count,
+        .health_check = SqliteSharedVectorStore.vtable_instance.health_check,
+        .deinit = &implDeinit,
+    };
+};
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 test "init with in-memory sqlite" {

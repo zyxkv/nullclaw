@@ -589,13 +589,18 @@ pub const Agent = struct {
                 if (save_key) |key| {
                     defer self.allocator.free(key);
                     mem.store(key, user_message, .conversation, self.memory_session_id) catch {};
+                    // Vector sync after auto-save
+                    if (self.mem_rt) |rt| {
+                        rt.syncVectorAfterStore(self.allocator, key, user_message);
+                    }
                 }
             }
         }
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
+        // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessage(self.allocator, mem, user_message, self.memory_session_id)
+            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, user_message);
         errdefer self.allocator.free(enriched);
@@ -883,7 +888,16 @@ pub const Agent = struct {
                         const save_key = try std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts});
                         defer self.allocator.free(save_key);
                         mem.store(save_key, summary, .daily, self.memory_session_id) catch {};
+                        // Vector sync after auto-save
+                        if (self.mem_rt) |rt| {
+                            rt.syncVectorAfterStore(self.allocator, save_key, summary);
+                        }
                     }
+                }
+
+                // Drain durable outbox after turn completion (best-effort)
+                if (self.mem_rt) |rt| {
+                    _ = rt.drainOutbox(self.allocator);
                 }
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -2490,8 +2504,9 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{});
     defer tools_mod.deinitTools(allocator, tools);
 
-    var mem = try memory_mod.createMemory(allocator, "sqlite", ":memory:");
-    defer mem.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    var mem = sqlite_mem.memory();
     tools_mod.bindMemoryTools(tools, mem);
 
     const DummyProvider = struct {

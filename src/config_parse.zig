@@ -1109,6 +1109,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (rel.get("canary_hybrid_percent")) |v| if (v == .integer) {
                         self.memory.reliability.canary_hybrid_percent = @intCast(v.integer);
                     };
+                    if (rel.get("fallback_policy")) |v| if (v == .string) {
+                        self.memory.reliability.fallback_policy = v.string;
+                    };
                 }
             }
 
@@ -1152,6 +1155,25 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     };
                     if (rd.get("ttl_seconds")) |v| if (v == .integer) {
                         self.memory.redis.ttl_seconds = @intCast(v.integer);
+                    };
+                }
+            }
+
+            // api
+            if (mem.object.get("api")) |api_val| {
+                if (api_val == .object) {
+                    const api = api_val.object;
+                    if (api.get("url")) |v| if (v == .string) {
+                        self.memory.api.url = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (api.get("api_key")) |v| if (v == .string) {
+                        self.memory.api.api_key = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (api.get("timeout_ms")) |v| if (v == .integer) {
+                        self.memory.api.timeout_ms = @intCast(v.integer);
+                    };
+                    if (api.get("namespace")) |v| if (v == .string) {
+                        self.memory.api.namespace = try self.allocator.dupe(u8, v.string);
                     };
                 }
             }
@@ -1202,6 +1224,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     };
                 }
             }
+
+            // Apply profile defaults after all explicit overrides have been parsed.
+            // Only sets fields that are still at their default values.
+            self.memory.applyProfileDefaults();
         }
     }
 
