@@ -153,6 +153,15 @@ pub const Config = struct {
         return null;
     }
 
+    /// Look up whether a provider supports native tool calls.
+    /// Returns true (default) if provider is not in the list.
+    pub fn getProviderNativeTools(self: *const Config, name: []const u8) bool {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.native_tools;
+        }
+        return true;
+    }
+
     /// Sync flat convenience fields from the nested sub-configs.
     pub fn syncFlatFields(self: *Config) void {
         self.temperature = self.default_temperature;
