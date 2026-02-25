@@ -1086,6 +1086,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 if (au == .string) pe.base_url = try self.allocator.dupe(u8, au.string);
                             }
                         }
+                        if (val.object.get("native_tools")) |nt| {
+                            if (nt == .bool) pe.native_tools = nt.bool;
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);
