@@ -484,6 +484,12 @@ fn findSubagentManager(self: anytype) ?*subagent_mod.SubagentManager {
     return spawn_tool.manager;
 }
 
+pub fn refreshSubagentToolContext(self: anytype) void {
+    const spawn_tool = findSpawnTool(self) orelse return;
+    spawn_tool.default_channel = "agent";
+    spawn_tool.default_chat_id = self.memory_session_id orelse "agent";
+}
+
 fn findShellTool(self: anytype) ?Tool {
     for (self.tools) |t| {
         if (std.ascii.eqlIgnoreCase(t.name(), "shell")) return t;
@@ -1255,12 +1261,22 @@ fn taskStatusLabel(status: subagent_mod.TaskStatus) []const u8 {
     };
 }
 
+fn currentSubagentSessionKey(self: anytype) []const u8 {
+    return self.memory_session_id orelse "agent";
+}
+
+fn taskBelongsToCurrentSession(self: anytype, state: *const subagent_mod.TaskState) bool {
+    const task_session = state.session_key orelse return false;
+    return std.mem.eql(u8, task_session, currentSubagentSessionKey(self));
+}
+
 fn freeSubagentTaskState(manager: *subagent_mod.SubagentManager, state: *subagent_mod.TaskState) void {
     if (state.thread) |thread| {
         thread.join();
     }
     if (state.result) |r| manager.allocator.free(r);
     if (state.error_msg) |e| manager.allocator.free(e);
+    if (state.session_key) |sk| manager.allocator.free(sk);
     manager.allocator.free(state.label);
     manager.allocator.destroy(state);
 }
@@ -1276,19 +1292,17 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
     manager.mutex.lock();
     defer manager.mutex.unlock();
 
-    if (manager.tasks.count() == 0) {
-        try w.writeAll("No subagents tracked in this session.");
-        return try out.toOwnedSlice(self.allocator);
-    }
-
     var running: u32 = 0;
     var completed: u32 = 0;
     var failed: u32 = 0;
+    var visible_count: u32 = 0;
 
     var it = manager.tasks.iterator();
     while (it.next()) |entry| {
         const task_id = entry.key_ptr.*;
         const state = entry.value_ptr.*;
+        if (!taskBelongsToCurrentSession(self, state)) continue;
+        visible_count += 1;
         switch (state.status) {
             .running => running += 1,
             .completed => completed += 1,
@@ -1300,6 +1314,11 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
             try w.print(" error={s}", .{state.error_msg.?});
         }
         try w.writeAll("\n");
+    }
+
+    if (visible_count == 0) {
+        try w.writeAll("No subagents tracked in this session.");
+        return try out.toOwnedSlice(self.allocator);
     }
 
     try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
@@ -1342,6 +1361,7 @@ fn handleAgentsCommand(self: anytype) ![]const u8 {
     var it = manager.tasks.iterator();
     while (it.next()) |entry| {
         const state = entry.value_ptr.*;
+        if (!taskBelongsToCurrentSession(self, state)) continue;
         tracked += 1;
         if (state.status == .running) running += 1;
     }
@@ -1374,6 +1394,7 @@ fn handleKillCommand(self: anytype, arg: []const u8) ![]const u8 {
         while (it.next()) |entry| {
             const task_id = entry.key_ptr.*;
             const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
             if (state.status == .running) {
                 running += 1;
             } else {
@@ -1407,6 +1428,9 @@ fn handleKillCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     const state = manager.tasks.get(task_id) orelse
         return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+    if (!taskBelongsToCurrentSession(self, state)) {
+        return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+    }
     if (state.status == .running) {
         return try std.fmt.allocPrint(
             self.allocator,
@@ -1454,6 +1478,9 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         const state = manager.tasks.get(task_id) orelse
             return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        if (!taskBelongsToCurrentSession(self, state)) {
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        }
 
         if (state.status == .running) {
             return try std.fmt.allocPrint(
@@ -1497,6 +1524,16 @@ fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Usage: /steer <id> <message>");
     if (message.len == 0) return try self.allocator.dupe(u8, "Usage: /steer <id> <message>");
 
+    if (findSubagentManager(self)) |manager| {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const state = manager.tasks.get(task_id) orelse
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        if (!taskBelongsToCurrentSession(self, state)) {
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        }
+    }
+
     const follow_up = try std.fmt.allocPrint(
         self.allocator,
         "Follow up for task #{d}: {s}",
@@ -1531,20 +1568,24 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (findSubagentManager(self)) |manager| {
         manager.mutex.lock();
         defer manager.mutex.unlock();
-        if (manager.tasks.count() > 0) {
-            wrote_any = true;
-            var running: u32 = 0;
-            var completed: u32 = 0;
-            var failed: u32 = 0;
+        var running: u32 = 0;
+        var completed: u32 = 0;
+        var failed: u32 = 0;
+        var visible: u32 = 0;
 
-            var it = manager.tasks.iterator();
-            while (it.next()) |entry| {
-                switch (entry.value_ptr.*.status) {
-                    .running => running += 1,
-                    .completed => completed += 1,
-                    .failed => failed += 1,
-                }
+        var it = manager.tasks.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
+            visible += 1;
+            switch (state.status) {
+                .running => running += 1,
+                .completed => completed += 1,
+                .failed => failed += 1,
             }
+        }
+        if (visible > 0) {
+            wrote_any = true;
             try w.print(
                 "Subagent tasks: running={d}, completed={d}, failed={d}\n",
                 .{ running, completed, failed },
@@ -1566,7 +1607,17 @@ fn handleStopCommand(self: anytype) ![]const u8 {
     }
 
     if (findSubagentManager(self)) |manager| {
-        const running = manager.getRunningCount();
+        var running: u32 = 0;
+        manager.mutex.lock();
+        {
+            var it = manager.tasks.iterator();
+            while (it.next()) |entry| {
+                const state = entry.value_ptr.*;
+                if (!taskBelongsToCurrentSession(self, state)) continue;
+                if (state.status == .running) running += 1;
+            }
+        }
+        manager.mutex.unlock();
         if (running > 0) {
             if (cleared_pending) {
                 return try std.fmt.allocPrint(

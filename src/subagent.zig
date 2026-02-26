@@ -23,6 +23,7 @@ pub const TaskStatus = enum {
 pub const TaskState = struct {
     status: TaskStatus,
     label: []const u8,
+    session_key: ?[]const u8 = null,
     result: ?[]const u8 = null,
     error_msg: ?[]const u8 = null,
     started_at: i64,
@@ -96,6 +97,7 @@ pub const SubagentManager = struct {
             }
             if (state.result) |r| self.allocator.free(r);
             if (state.error_msg) |e| self.allocator.free(e);
+            if (state.session_key) |sk| self.allocator.free(sk);
             self.allocator.free(state.label);
             self.allocator.destroy(state);
         }
@@ -120,23 +122,40 @@ pub const SubagentManager = struct {
         self.next_id += 1;
 
         const state = try self.allocator.create(TaskState);
+        errdefer self.allocator.destroy(state);
+        const state_label = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(state_label);
+        const state_session = try self.allocator.dupe(u8, origin_chat_id);
+        errdefer self.allocator.free(state_session);
         state.* = .{
             .status = .running,
-            .label = try self.allocator.dupe(u8, label),
+            .label = state_label,
+            .session_key = state_session,
             .started_at = std.time.milliTimestamp(),
         };
 
         try self.tasks.put(self.allocator, task_id, state);
+        errdefer _ = self.tasks.remove(task_id);
+
+        const task_copy = try self.allocator.dupe(u8, task);
+        errdefer self.allocator.free(task_copy);
+        const label_copy = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(label_copy);
+        const origin_channel_copy = try self.allocator.dupe(u8, origin_channel);
+        errdefer self.allocator.free(origin_channel_copy);
+        const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
+        errdefer self.allocator.free(origin_chat_copy);
 
         // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
+        errdefer self.allocator.destroy(ctx);
         ctx.* = .{
             .manager = self,
             .task_id = task_id,
-            .task = try self.allocator.dupe(u8, task),
-            .label = try self.allocator.dupe(u8, label),
-            .origin_channel = try self.allocator.dupe(u8, origin_channel),
-            .origin_chat_id = try self.allocator.dupe(u8, origin_chat_id),
+            .task = task_copy,
+            .label = label_copy,
+            .origin_channel = origin_channel_copy,
+            .origin_chat_id = origin_chat_copy,
         };
 
         state.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, subagentThreadFn, .{ctx});
@@ -219,6 +238,7 @@ pub const SubagentManager = struct {
             self.allocator.free(content);
 
             b.publishInbound(msg) catch |err| {
+                msg.deinit(self.allocator);
                 log.err("subagent: failed to publish result to bus: {}", .{err});
             };
         }
@@ -413,4 +433,43 @@ test "SubagentManager completeTask routes via bus" {
     if (bus.consumeInbound()) |msg| {
         msg.deinit(std.testing.allocator);
     }
+}
+
+test "SubagentManager spawn stores session key" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("quick task", "session-check", "agent", "session:42");
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    const state = mgr.tasks.get(task_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.session_key != null);
+    try std.testing.expectEqualStrings("session:42", state.session_key.?);
+}
+
+test "SubagentManager spawn rollback removes task on out-of-memory" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = alloc,
+    };
+    var mgr = SubagentManager.init(alloc, &cfg, null, .{});
+    defer mgr.deinit();
+
+    try mgr.tasks.ensureTotalCapacity(alloc, 1);
+    failing.fail_index = failing.alloc_index + 4;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        mgr.spawn("oom-task", "oom-label", "agent", "session:oom"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mgr.tasks.count());
+    try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
 }

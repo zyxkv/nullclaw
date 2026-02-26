@@ -567,6 +567,7 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
+        commands.refreshSubagentToolContext(self);
 
         // Handle slash commands before sending to LLM (saves tokens)
         if (try self.handleSlashCommand(user_message)) |response| {
