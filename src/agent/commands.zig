@@ -186,6 +186,9 @@ fn invalidateSystemPromptCache(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "has_system_prompt")) {
         self.has_system_prompt = false;
     }
+    if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
+        self.system_prompt_has_conversation_context = false;
+    }
 }
 
 test "configPrimaryModelForSelection treats unknown leading segment as model for default provider" {

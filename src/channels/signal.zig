@@ -48,6 +48,10 @@ const log = std.log.scoped(.signal);
 /// Prefix used to identify group targets in reply_target strings.
 pub const GROUP_TARGET_PREFIX = "group:";
 
+/// Interval for re-sending typing indicator (8 seconds).
+const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
+const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms; // 100ms sleep steps
+
 /// Extract a stable group peer ID from reply_target.
 /// For non-group targets returns the raw target or "unknown".
 pub fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
@@ -121,6 +125,17 @@ pub const SignalChannel = struct {
     sse_retry_delay_secs: u64 = 2,
     /// Earliest wall-clock timestamp (seconds) for the next reconnect attempt.
     sse_next_retry_at: i64 = 0,
+
+    /// Typing indicator management (mirrors Discord implementation).
+    typing_mu: std.Thread.Mutex = .{},
+    typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+
+    const TypingTask = struct {
+        channel: *SignalChannel,
+        target: []const u8,
+        stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        thread: ?std.Thread = null,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -341,6 +356,8 @@ pub const SignalChannel = struct {
             .reply_target = reply_target_str,
             .first_name = if (source_name) |sn| if (sn.len > 0) try allocator.dupe(u8, sn) else null else null,
             .is_group = dm_group_id != null,
+            .sender_uuid = if (source) |src| if (src.len > 0 and isUuid(src)) try allocator.dupe(u8, src) else null else null,
+            .group_id = if (dm_group_id) |gid| try allocator.dupe(u8, gid) else null,
         };
 
         return msg;
@@ -706,10 +723,79 @@ pub const SignalChannel = struct {
     }
 
     pub fn startTyping(self: *SignalChannel, target: []const u8) !void {
-        self.sendTypingIndicator(target);
+        if (target.len == 0) return;
+
+        try self.stopTyping(target);
+
+        const key_copy = try self.allocator.dupe(u8, target);
+        errdefer self.allocator.free(key_copy);
+
+        const task = try self.allocator.create(TypingTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .channel = self,
+            .target = key_copy,
+        };
+
+        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        errdefer {
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+        }
+
+        self.typing_mu.lock();
+        defer self.typing_mu.unlock();
+        try self.typing_handles.put(self.allocator, key_copy, task);
     }
 
-    pub fn stopTyping(_: *SignalChannel, _: []const u8) !void {}
+    pub fn stopTyping(self: *SignalChannel, target: []const u8) !void {
+        var removed_key: ?[]u8 = null;
+        var removed_task: ?*TypingTask = null;
+
+        self.typing_mu.lock();
+        if (self.typing_handles.fetchRemove(target)) |entry| {
+            removed_key = @constCast(entry.key);
+            removed_task = entry.value;
+        }
+        self.typing_mu.unlock();
+
+        if (removed_task) |task| {
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+            self.allocator.destroy(task);
+        }
+        if (removed_key) |key| {
+            self.allocator.free(key);
+        }
+    }
+
+    fn stopAllTyping(self: *SignalChannel) void {
+        self.typing_mu.lock();
+        var handles = self.typing_handles;
+        self.typing_handles = .empty;
+        self.typing_mu.unlock();
+
+        var it = handles.iterator();
+        while (it.next()) |entry| {
+            const task = entry.value_ptr.*;
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+            self.allocator.destroy(task);
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        handles.deinit(self.allocator);
+    }
+
+    fn typingLoop(task: *TypingTask) void {
+        while (!task.stop_requested.load(.acquire)) {
+            task.channel.sendTypingIndicator(task.target);
+            var elapsed: u64 = 0;
+            while (elapsed < TYPING_INTERVAL_NS and !task.stop_requested.load(.acquire)) {
+                std.Thread.sleep(TYPING_SLEEP_STEP_NS);
+                elapsed += TYPING_SLEEP_STEP_NS;
+            }
+        }
+    }
 
     // ── Health Check ────────────────────────────────────────────────
 
@@ -970,6 +1056,8 @@ pub const SignalChannel = struct {
         self.sse_next_retry_at = 0;
         // Clean up SSE buffer
         self.sse_buffer.deinit(self.allocator);
+        // Clean up typing indicator threads
+        self.stopAllTyping();
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
@@ -1561,6 +1649,7 @@ test "signal startTyping and stopTyping are safe in tests" {
         true,
         true,
     );
+    defer ch.stopAllTyping();
     try ch.startTyping("+15551234567");
     try ch.stopTyping("+15551234567");
 }
@@ -2284,6 +2373,8 @@ test "process envelope group accepts uuid allowlist when source_number is presen
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expect(m.is_group);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
 }
 
 test "process envelope group sender not in group_allow_from" {
@@ -2398,6 +2489,8 @@ test "process envelope uuid sender dm" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(uuid, m.sender);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
     try std.testing.expectEqualStrings("Privacy User", m.first_name.?);
     try std.testing.expectEqualStrings("Hello from privacy user", m.content);
     try std.testing.expectEqualStrings(uuid, m.reply_target.?);
@@ -2440,6 +2533,8 @@ test "process envelope uuid sender in group" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(uuid, m.sender);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
     try std.testing.expectEqualStrings("group:testgroup", m.reply_target.?);
     try std.testing.expect(m.is_group);
     // Group message should still route as Group.
@@ -2625,6 +2720,7 @@ test "process envelope sender prefers source number" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("+1111111111", m.sender);
+    try std.testing.expect(m.sender_uuid == null);
 }
 
 test "process envelope sender falls back to source" {
@@ -2655,6 +2751,8 @@ test "process envelope sender falls back to source" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(uuid, m.sender);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
 }
 
 test "process envelope sender none when both missing" {

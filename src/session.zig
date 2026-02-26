@@ -12,6 +12,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const Agent = @import("agent/root.zig").Agent;
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
@@ -178,11 +179,15 @@ pub const SessionManager = struct {
 
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
-    pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8) ![]const u8 {
+    pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
         defer session.mutex.unlock();
+
+        // Set conversation context for this turn (Signal-specific for now)
+        session.agent.conversation_context = conversation_context;
+        defer session.agent.conversation_context = null;
 
         const response = try session.agent.turn(content);
         session.turn_count += 1;
@@ -420,9 +425,42 @@ test "processMessage returns mock response" {
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
-    const resp = try sm.processMessage("user:1", "hi");
+    const resp = try sm.processMessage("user:1", "hi", null);
     defer testing.allocator.free(resp);
     try testing.expectEqualStrings("Hello from mock", resp);
+}
+
+test "processMessage refreshes system prompt when conversation context is cleared" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const sender_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const with_context: ?ConversationContext = .{
+        .channel = "signal",
+        .sender_number = "+15551234567",
+        .sender_uuid = sender_uuid,
+        .group_id = null,
+        .is_group = false,
+    };
+
+    const resp1 = try sm.processMessage("ctx:user", "first", with_context);
+    defer testing.allocator.free(resp1);
+
+    const session = try sm.getOrCreate("ctx:user");
+    try testing.expect(session.agent.history.items.len > 0);
+    const sys1 = session.agent.history.items[0].content;
+    try testing.expect(std.mem.indexOf(u8, sys1, "## Conversation Context") != null);
+    try testing.expect(std.mem.indexOf(u8, sys1, sender_uuid) != null);
+
+    const resp2 = try sm.processMessage("ctx:user", "second", null);
+    defer testing.allocator.free(resp2);
+
+    try testing.expect(session.agent.history.items.len > 0);
+    const sys2 = session.agent.history.items[0].content;
+    try testing.expect(std.mem.indexOf(u8, sys2, "## Conversation Context") == null);
+    try testing.expect(std.mem.indexOf(u8, sys2, sender_uuid) == null);
 }
 
 test "processMessage updates last_active" {
@@ -437,7 +475,7 @@ test "processMessage updates last_active" {
     // Small sleep so timestamp changes
     std.Thread.sleep(10 * std.time.ns_per_ms);
 
-    const resp = try sm.processMessage("user:2", "hello");
+    const resp = try sm.processMessage("user:2", "hello", null);
     defer testing.allocator.free(resp);
 
     try testing.expect(session.last_active >= before);
@@ -449,13 +487,13 @@ test "processMessage increments turn_count" {
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
-    const resp1 = try sm.processMessage("user:3", "msg1");
+    const resp1 = try sm.processMessage("user:3", "msg1", null);
     defer testing.allocator.free(resp1);
 
     const session = try sm.getOrCreate("user:3");
     try testing.expectEqual(@as(u64, 1), session.turn_count);
 
-    const resp2 = try sm.processMessage("user:3", "msg2");
+    const resp2 = try sm.processMessage("user:3", "msg2", null);
     defer testing.allocator.free(resp2);
     try testing.expectEqual(@as(u64, 2), session.turn_count);
 }
@@ -466,7 +504,7 @@ test "processMessage preserves session across calls" {
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
-    const resp1 = try sm.processMessage("persist:1", "first");
+    const resp1 = try sm.processMessage("persist:1", "first", null);
     defer testing.allocator.free(resp1);
 
     const session = try sm.getOrCreate("persist:1");
@@ -475,7 +513,7 @@ test "processMessage preserves session across calls" {
 
     const history_before = session.agent.historyLen();
 
-    const resp2 = try sm.processMessage("persist:1", "second");
+    const resp2 = try sm.processMessage("persist:1", "second", null);
     defer testing.allocator.free(resp2);
 
     // History should have grown (user msg + assistant response added)
@@ -488,10 +526,10 @@ test "processMessage different keys — independent sessions" {
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
-    const resp_a = try sm.processMessage("user:a", "hello a");
+    const resp_a = try sm.processMessage("user:a", "hello a", null);
     defer testing.allocator.free(resp_a);
 
-    const resp_b = try sm.processMessage("user:b", "hello b");
+    const resp_b = try sm.processMessage("user:b", "hello b", null);
     defer testing.allocator.free(resp_b);
 
     const sa = try sm.getOrCreate("user:a");
@@ -527,7 +565,7 @@ test "processMessage /new clears autosave only for current session" {
     try mem.store("autosave_user_b", "session b", .conversation, "sess-b");
     try testing.expectEqual(@as(usize, 2), try mem.count());
 
-    const response = try sm.processMessage("sess-a", "/new");
+    const response = try sm.processMessage("sess-a", "/new", null);
     defer testing.allocator.free(response);
 
     const a_entry = try mem.get(testing.allocator, "autosave_user_a");
@@ -565,7 +603,7 @@ test "processMessage /new with model clears autosave only for current session" {
     try mem.store("autosave_user_b", "session b", .conversation, "sess-b");
     try testing.expectEqual(@as(usize, 2), try mem.count());
 
-    const response = try sm.processMessage("sess-a", "/new gpt-4o-mini");
+    const response = try sm.processMessage("sess-a", "/new gpt-4o-mini", null);
     defer testing.allocator.free(response);
 
     const a_entry = try mem.get(testing.allocator, "autosave_user_a");
@@ -603,7 +641,7 @@ test "processMessage /reset clears autosave only for current session" {
     try mem.store("autosave_user_b", "session b", .conversation, "sess-b");
     try testing.expectEqual(@as(usize, 2), try mem.count());
 
-    const response = try sm.processMessage("sess-a", "/reset");
+    const response = try sm.processMessage("sess-a", "/reset", null);
     defer testing.allocator.free(response);
 
     const a_entry = try mem.get(testing.allocator, "autosave_user_a");
@@ -641,7 +679,7 @@ test "processMessage /restart clears autosave only for current session" {
     try mem.store("autosave_user_b", "session b", .conversation, "sess-b");
     try testing.expectEqual(@as(usize, 2), try mem.count());
 
-    const response = try sm.processMessage("sess-a", "/restart");
+    const response = try sm.processMessage("sess-a", "/restart", null);
     defer testing.allocator.free(response);
 
     const a_entry = try mem.get(testing.allocator, "autosave_user_a");
@@ -667,7 +705,7 @@ test "processMessage with sqlite memory first turn does not panic" {
     var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
     defer sm.deinit();
 
-    const resp = try sm.processMessage("signal:session:1", "hello");
+    const resp = try sm.processMessage("signal:session:1", "hello", null);
     defer testing.allocator.free(resp);
     try testing.expectEqualStrings("ok", resp);
 
@@ -824,7 +862,7 @@ test "concurrent processMessage different keys — no crash" {
         handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator) void {
                 for (0..3) |_| {
-                    const resp = mgr.processMessage(key, "hello") catch return;
+                    const resp = mgr.processMessage(key, "hello", null) catch return;
                     alloc.free(resp);
                 }
             }
@@ -859,7 +897,7 @@ test "concurrent processMessage with sqlite memory does not panic" {
         handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator, failed_flag: *std.atomic.Value(bool)) void {
                 for (0..5) |_| {
-                    const resp = mgr.processMessage(key, "hello sqlite") catch {
+                    const resp = mgr.processMessage(key, "hello sqlite", null) catch {
                         failed_flag.store(true, .release);
                         return;
                     };
