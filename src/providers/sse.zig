@@ -60,7 +60,7 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
-/// Spawns `curl -s --no-buffer` and reads stdout incrementally.
+/// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
 /// For each SSE delta, calls `callback(ctx, chunk)`.
 /// Returns accumulated result after stream completes.
 pub fn curlStream(
@@ -69,6 +69,7 @@ pub fn curlStream(
     body: []const u8,
     auth_header: ?[]const u8,
     extra_headers: []const []const u8,
+    timeout_secs: u64,
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
@@ -82,6 +83,18 @@ pub fn curlStream(
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
+    argv_buf[argc] = "--fail-with-body";
+    argc += 1;
+
+    var timeout_buf: [32]u8 = undefined;
+    if (timeout_secs > 0) {
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = timeout_str;
+        argc += 1;
+    }
+
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
@@ -127,6 +140,7 @@ pub fn curlStream(
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
+    var saw_done = false;
 
     outer: while (true) {
         const n = file.read(&read_buf) catch break;
@@ -145,7 +159,10 @@ pub fn curlStream(
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
-                    .done => break :outer,
+                    .done => {
+                        saw_done = true;
+                        break :outer;
+                    },
                     .skip => {},
                 }
             } else {
@@ -154,8 +171,22 @@ pub fn curlStream(
         }
     }
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
+    // Parse a trailing line when the stream ends without a final '\n'.
+    if (!saw_done and line_buf.items.len > 0) {
+        const trailing = parseSseLine(allocator, line_buf.items) catch null;
+        line_buf.clearRetainingCapacity();
+        if (trailing) |result| {
+            switch (result) {
+                .delta => |text| {
+                    defer allocator.free(text);
+                    try accumulated.appendSlice(allocator, text);
+                    callback(ctx, root.StreamChunk.textDelta(text));
+                },
+                .done => {},
+                .skip => {},
+            }
+        }
+    }
 
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
@@ -168,6 +199,9 @@ pub fn curlStream(
         .Exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
     }
+
+    // Signal stream completion only after curl exits successfully.
+    callback(ctx, root.StreamChunk.finalChunk());
 
     const content = if (accumulated.items.len > 0)
         try allocator.dupe(u8, accumulated.items)

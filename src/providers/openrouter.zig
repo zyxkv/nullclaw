@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 
 const Provider = root.Provider;
@@ -285,6 +286,8 @@ pub const OpenRouterProvider = struct {
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .warmup = warmupImpl,
+        .stream_chat = streamChatImpl,
+        .supports_streaming = supportsStreamingImpl,
     };
 
     fn warmupImpl(ptr: *anyopaque) void {
@@ -361,6 +364,37 @@ pub const OpenRouterProvider = struct {
         return "OpenRouter";
     }
 
+    fn streamChatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *OpenRouterProvider = @ptrCast(@alignCast(ptr));
+        const api_key = self.api_key orelse return error.CredentialsNotSet;
+
+        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
+        defer allocator.free(body);
+
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenRouterApiError;
+
+        var referer_hdr_buf: [256]u8 = undefined;
+        const referer_hdr = std.fmt.bufPrint(&referer_hdr_buf, "HTTP-Referer: {s}", .{REFERER}) catch return error.OpenRouterApiError;
+
+        var title_hdr_buf: [128]u8 = undefined;
+        const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
+
+        return sse.curlStream(allocator, BASE_URL, body, auth_hdr, &.{ referer_hdr, title_hdr }, request.timeout_secs, callback, callback_ctx);
+    }
+
+    fn supportsStreamingImpl(_: *anyopaque) bool {
+        return true;
+    }
+
     fn deinitImpl(_: *anyopaque) void {}
 
     /// Build a full chat request JSON body from a ChatRequest.
@@ -384,9 +418,8 @@ pub const OpenRouterProvider = struct {
             try buf.appendSlice(allocator, "\",\"content\":");
             try root.serializeMessageContent(&buf, allocator, msg);
             if (msg.tool_call_id) |tc_id| {
-                try buf.appendSlice(allocator, ",\"tool_call_id\":\"");
-                try buf.appendSlice(allocator, tc_id);
-                try buf.append(allocator, '"');
+                try buf.appendSlice(allocator, ",\"tool_call_id\":");
+                try root.appendJsonString(&buf, allocator, tc_id);
             }
             try buf.append(allocator, '}');
         }
@@ -403,6 +436,48 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, '}');
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    /// Build a streaming chat request JSON body from a ChatRequest.
+    fn buildStreamingChatRequestBody(
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+    ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":\"");
+        try buf.appendSlice(allocator, model);
+        try buf.appendSlice(allocator, "\",\"messages\":[");
+
+        for (request.messages, 0..) |msg, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"role\":\"");
+            try buf.appendSlice(allocator, msg.role.toSlice());
+            try buf.appendSlice(allocator, "\",\"content\":");
+            try root.serializeMessageContent(&buf, allocator, msg);
+            if (msg.tool_call_id) |tc_id| {
+                try buf.appendSlice(allocator, ",\"tool_call_id\":");
+                try root.appendJsonString(&buf, allocator, tc_id);
+            }
+            try buf.append(allocator, '}');
+        }
+
+        try buf.append(allocator, ']');
+        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
+        }
+
+        try buf.appendSlice(allocator, ",\"stream\":true}");
         return try buf.toOwnedSlice(allocator);
     }
 };
@@ -636,3 +711,68 @@ test "chatWithHistory fails without key" {
     const result = p.chatWithHistory(std.testing.allocator, messages, null, "openai/gpt-4o", 0.7);
     try std.testing.expectError(error.CredentialsNotSet, result);
 }
+
+test "vtable stream_chat is not null" {
+    try std.testing.expect(OpenRouterProvider.vtable.stream_chat != null);
+}
+
+test "vtable supports_streaming is not null" {
+    try std.testing.expect(OpenRouterProvider.vtable.supports_streaming != null);
+}
+
+test "buildStreamingChatRequestBody with stream flag" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "test message" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "test-model",
+        .temperature = 0.7,
+    };
+    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "test-model", 0.7);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "buildStreamingChatRequestBody escapes tool_call_id" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .tool, .content = "done", .tool_call_id = "call_\"x\\y" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "test-model",
+    };
+    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "test-model", 0.7);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msg = parsed.value.object.get("messages").?.array.items[0].object;
+    try std.testing.expectEqualStrings("call_\"x\\y", msg.get("tool_call_id").?.string);
+}
+
+test "streamChatImpl fails without key" {
+    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    const provider = p.provider();
+
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &messages,
+        .model = "test-model",
+    };
+
+    var ctx: u8 = 0;
+    const result = provider.streamChat(
+        std.testing.allocator,
+        req,
+        "test-model",
+        0.7,
+        testCallback,
+        @ptrCast(&ctx),
+    );
+    try std.testing.expectError(error.CredentialsNotSet, result);
+}
+
+fn testCallback(_: *anyopaque, _: root.StreamChunk) void {}

@@ -449,7 +449,7 @@ pub const OpenAiCompatibleProvider = struct {
         else
             null;
 
-        return sse.curlStream(allocator, url, body, auth_hdr, &.{}, callback, callback_ctx);
+        return sse.curlStream(allocator, url, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {

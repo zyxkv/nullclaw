@@ -197,7 +197,7 @@ pub const OpenAiProvider = struct {
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
-        return sse.curlStream(allocator, BASE_URL, body, auth_hdr, &.{}, callback, callback_ctx);
+        return sse.curlStream(allocator, BASE_URL, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
