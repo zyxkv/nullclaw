@@ -7,10 +7,11 @@ Why vendored:
 - avoid runtime nested zip downloads during `zig build`
 - make builds deterministic across environments where Zig zip temp handling fails
   (see issue #142)
+- integrity is enforced by SHA-256 verification in the root `build.zig` when SQLite is enabled
 
 Contents:
-- `build.zig` and `build.zig.zon` from `allyourcodebase/sqlite3`
-- `sqlite3.c`, `sqlite3.h`, `sqlite3ext.h`, `shell.c` from SQLite 3.51.0 amalgamation
+- `build.zig` and `build.zig.zon` based on `allyourcodebase/sqlite3` and patched to library-only mode for nullclaw
+- `sqlite3.c`, `sqlite3.h`, `sqlite3ext.h` from SQLite 3.51.0 amalgamation
 
 Upstream references:
 - Zig wrapper: https://github.com/allyourcodebase/sqlite3
