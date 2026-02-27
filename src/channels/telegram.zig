@@ -1812,6 +1812,11 @@ fn appendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
 /// This acts as a debouncer for rapid-fire messages and automatically reassembles
 /// long texts that were split by the Telegram client (which splits at 4096 chars).
 /// Handles interleaving of messages from different chats.
+fn isSlashCommandMessage(content: []const u8) bool {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "/");
+}
+
 fn mergeConsecutiveMessages(
     allocator: std.mem.Allocator,
     messages: *std.ArrayListUnmanaged(root.ChannelMessage),
@@ -1825,7 +1830,7 @@ fn mergeConsecutiveMessages(
             continue;
         };
 
-        if (std.mem.startsWith(u8, messages.items[i].content, "/")) {
+        if (isSlashCommandMessage(messages.items[i].content)) {
             i += 1;
             continue;
         }
@@ -1837,7 +1842,7 @@ fn mergeConsecutiveMessages(
             {
                 if (messages.items[j].message_id) |mid2| {
                     if (mid2 == mid1 + 1) {
-                        if (!std.mem.startsWith(u8, messages.items[j].content, "/")) {
+                        if (!isSlashCommandMessage(messages.items[j].content)) {
                             found_idx = j;
                         }
                     }
@@ -1848,6 +1853,7 @@ fn mergeConsecutiveMessages(
 
         if (found_idx) |j| {
             var merged: std.ArrayListUnmanaged(u8) = .empty;
+            defer merged.deinit(allocator);
             var merge_ok = true;
             merged.appendSlice(allocator, messages.items[i].content) catch {
                 merge_ok = false;
@@ -1872,8 +1878,6 @@ fn mergeConsecutiveMessages(
                     extra.deinit(allocator);
 
                     continue; // Do not increment i, allow chain-merging
-                } else {
-                    merged.deinit(allocator);
                 }
             }
         }
@@ -2975,6 +2979,51 @@ test "telegram mergeConsecutiveMessages skips commands" {
     try std.testing.expectEqualStrings("some text", messages.items[1].content);
 }
 
+test "telegram mergeConsecutiveMessages skips whitespace-padded commands" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, " \t/help"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 10,
+    });
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "some text"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 11,
+    });
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "\n/new"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 12,
+    });
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    // Commands should stay isolated even with leading whitespace/newline.
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqualStrings(" \t/help", messages.items[0].content);
+    try std.testing.expectEqualStrings("some text", messages.items[1].content);
+    try std.testing.expectEqualStrings("\n/new", messages.items[2].content);
+}
+
 test "telegram mergeConsecutiveMessages chain merges three parts" {
     const alloc = std.testing.allocator;
     var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
@@ -3077,6 +3126,50 @@ test "telegram mergeConsecutiveMessages non-consecutive ids not merged" {
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("First", messages.items[0].content);
     try std.testing.expectEqualStrings("Second", messages.items[1].content);
+}
+
+test "telegram mergeConsecutiveMessages allocation failure does not leak" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+
+    const large_len = 32 * 1024;
+    const large_payload = try alloc.alloc(u8, large_len);
+    @memset(large_payload, 'x');
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "A"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 1,
+    });
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = large_payload,
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 2,
+    });
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    // First temp append succeeds; second temp allocation fails.
+    failing.fail_index = failing.alloc_index + 1;
+
+    mergeConsecutiveMessages(failing.allocator(), &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("A", messages.items[0].content);
+    try std.testing.expectEqual(@as(usize, large_len), messages.items[1].content.len);
+    try std.testing.expectEqual(@as(u8, 'x'), messages.items[1].content[0]);
 }
 
 test "telegram mergeMediaGroups single item no merge" {
