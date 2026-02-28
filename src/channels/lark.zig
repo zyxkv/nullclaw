@@ -149,7 +149,9 @@ pub const LarkChannel = struct {
         const chat_id_val = msg_obj.object.get("chat_id");
         const chat_id = if (chat_id_val) |cv| (if (cv == .string) cv.string else open_id) else open_id;
 
-        if (std.mem.eql(u8, chat_type, "group")) {
+        const is_group_chat = std.mem.eql(u8, chat_type, "group") or std.mem.eql(u8, chat_type, "topic_group");
+
+        if (is_group_chat) {
             // Check mentions array in the event
             const mentions_val = msg_obj.object.get("mentions");
             if (!shouldRespondInGroup(mentions_val, raw_text, "")) {
@@ -173,7 +175,7 @@ pub const LarkChannel = struct {
             .sender = try allocator.dupe(u8, chat_id),
             .content = try allocator.dupe(u8, text),
             .timestamp = timestamp,
-            .is_group = std.mem.eql(u8, chat_type, "group"),
+            .is_group = is_group_chat,
         });
 
         return result.toOwnedSlice(allocator);
@@ -566,6 +568,28 @@ test "lark parse group message marks is_group" {
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_group_user"}},"message":{"message_type":"text","content":"{\"text\":\"hello group\"}","chat_type":"group","mentions":[{"key":"@_user_1"}],"chat_id":"oc_group_1","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(msgs[0].is_group);
+}
+
+test "lark parse topic_group message marks is_group" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_topic_user"}},"message":{"message_type":"text","content":"{\"text\":\"hello topic\"}","chat_type":"topic_group","mentions":[{"key":"@_user_1"}],"chat_id":"oc_topic_1","create_time":"1000"}}}
     ;
 
     const msgs = try ch.parseEventPayload(allocator, payload);

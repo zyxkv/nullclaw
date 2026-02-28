@@ -257,14 +257,26 @@ pub const ProviderHolder = union(enum) {
         self.provider().deinit();
     }
 
-    /// Create a ProviderHolder from a provider name string and optional API key.
-    /// Uses `classifyProvider` to route to the correct concrete provider.
+    /// Backward-compatible factory entrypoint (defaults to chat/completions wire API).
     pub fn fromConfig(
         allocator: std.mem.Allocator,
         provider_name: []const u8,
         api_key: ?[]const u8,
         base_url: ?[]const u8,
         native_tools: bool,
+    ) ProviderHolder {
+        return fromConfigWithWireApi(allocator, provider_name, api_key, base_url, native_tools, null);
+    }
+
+    /// Create a ProviderHolder from provider config, including optional wire_api override.
+    /// Uses `classifyProvider` to route to the correct concrete provider.
+    pub fn fromConfigWithWireApi(
+        allocator: std.mem.Allocator,
+        provider_name: []const u8,
+        api_key: ?[]const u8,
+        base_url: ?[]const u8,
+        native_tools: bool,
+        wire_api: ?[]const u8,
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
@@ -306,6 +318,7 @@ pub const ProviderHolder = union(enum) {
 
                 // Apply config-level native_tools override.
                 prov.native_tools = native_tools;
+                prov.wire_api = compatible.parseWireApi(wire_api);
 
                 break :blk .{ .compatible = prov };
             },
@@ -329,6 +342,7 @@ pub const ProviderHolder = union(enum) {
                     .bearer,
                 );
                 prov.native_tools = native_tools;
+                prov.wire_api = compatible.parseWireApi(wire_api);
                 break :blk .{ .compatible = prov };
             } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
         };

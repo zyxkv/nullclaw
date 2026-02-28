@@ -224,8 +224,6 @@ pub const ChannelRuntime = struct {
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
         var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
         errdefer runtime_provider.deinit();
-
-        const provider_i = runtime_provider.provider();
         const resolved_key = runtime_provider.primaryApiKey();
 
         // MCP tools
@@ -292,16 +290,13 @@ pub const ChannelRuntime = struct {
         noop_obs.* = .{};
         const obs = noop_obs.observer();
 
-        // Session manager
-        var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
-        session_mgr.policy = security_policy;
-
-        // Self — heap-allocated so pointers remain stable
+        // Self — heap-allocated so provider/session pointers remain stable.
         const self = try allocator.create(ChannelRuntime);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .config = config,
-            .session_mgr = session_mgr,
+            .session_mgr = undefined,
             .provider_bundle = runtime_provider,
             .tools = tools,
             .mem_rt = mem_rt,
@@ -310,6 +305,22 @@ pub const ChannelRuntime = struct {
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
         };
+
+        // Important: build SessionManager from self.provider_bundle so the
+        // provider vtable pointer references stable heap-owned storage.
+        const provider_i = self.provider_bundle.provider();
+        self.session_mgr = session_mod.SessionManager.init(
+            allocator,
+            config,
+            provider_i,
+            tools,
+            mem_opt,
+            obs,
+            if (mem_rt) |rt| rt.session_store else null,
+            if (mem_rt) |*rt| rt.response_cache else null,
+        );
+        self.session_mgr.policy = security_policy;
+
         // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
         // and into memory tools for retrieval pipeline + vector sync.
         // self is heap-allocated so the pointer is stable.

@@ -29,6 +29,29 @@ pub const AuthStyle = enum {
     }
 };
 
+/// Wire protocol used by OpenAI-compatible providers.
+pub const WireApi = enum {
+    /// Standard OpenAI Chat Completions endpoint.
+    chat_completions,
+    /// Responses endpoint in SSE mode (used by some codex-style gateways).
+    responses_stream,
+};
+
+/// Parse provider wire_api config.
+/// Supported values:
+/// - null / unknown -> chat_completions
+/// - "responses" / "responses_stream" -> responses_stream
+pub fn parseWireApi(value: ?[]const u8) WireApi {
+    const raw = value orelse return .chat_completions;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "responses") or
+        std.ascii.eqlIgnoreCase(trimmed, "responses_stream"))
+    {
+        return .responses_stream;
+    }
+    return .chat_completions;
+}
+
 /// A provider that speaks the OpenAI-compatible chat completions API.
 ///
 /// Used by: Venice, Vercel, Cloudflare, Moonshot, Synthetic, OpenCode,
@@ -51,6 +74,8 @@ pub const OpenAiCompatibleProvider = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// When false, the agent uses XML tool format via system prompt.
     native_tools: bool = true,
+    /// Protocol wire format (chat/completions vs responses-stream).
+    wire_api: WireApi = .chat_completions,
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -140,15 +165,22 @@ pub const OpenAiCompatibleProvider = struct {
         message: []const u8,
         model: []const u8,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}]}]");
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"instructions":"{s}","stream":false}}
-            , .{ model, message, sys });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"stream":false}}
-            , .{ model, message });
+            if (sys.len > 0) {
+                try buf.appendSlice(allocator, ",\"instructions\":");
+                try root.appendJsonString(&buf, allocator, sys);
+            }
         }
+        try buf.appendSlice(allocator, ",\"stream\":true,\"store\":false}");
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Extract text from a Responses API JSON response.
@@ -159,30 +191,56 @@ pub const OpenAiCompatibleProvider = struct {
         defer parsed.deinit();
         const root_obj = parsed.value.object;
 
-        // Check top-level output_text first
+        // Check top-level output_text first.
         if (root_obj.get("output_text")) |ot| {
             if (ot == .string) {
                 const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
-                if (trimmed.len > 0) {
-                    return try allocator.dupe(u8, trimmed);
+                if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+            }
+        }
+
+        // Some gateways wrap payload inside "response": {...}.
+        const wrapped_obj: ?std.json.ObjectMap = blk: {
+            if (root_obj.get("response")) |resp| {
+                if (resp == .object) break :blk resp.object;
+            }
+            break :blk null;
+        };
+
+        if (wrapped_obj) |obj| {
+            if (obj.get("output_text")) |ot| {
+                if (ot == .string) {
+                    const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
+                    if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
                 }
             }
         }
 
-        // Walk output[*].content[*] looking for type "output_text"
-        if (root_obj.get("output")) |output_arr| {
+        const output_arr_val: ?std.json.Value = blk: {
+            if (root_obj.get("output")) |out| break :blk out;
+            if (wrapped_obj) |obj| {
+                if (obj.get("output")) |out| break :blk out;
+            }
+            break :blk null;
+        };
+
+        if (output_arr_val) |output_arr| {
+            if (output_arr != .array) return error.NoResponseContent;
+
+            // Walk output[*].content[*] looking for type "output_text"
             for (output_arr.array.items) |item| {
+                if (item != .object) continue;
                 if (item.object.get("content")) |content_arr| {
+                    if (content_arr != .array) continue;
                     for (content_arr.array.items) |content| {
+                        if (content != .object) continue;
                         const cobj = content.object;
                         if (cobj.get("type")) |t| {
                             if (t == .string and std.mem.eql(u8, t.string, "output_text")) {
                                 if (cobj.get("text")) |text| {
                                     if (text == .string) {
                                         const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
-                                        if (trimmed.len > 0) {
-                                            return try allocator.dupe(u8, trimmed);
-                                        }
+                                        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
                                     }
                                 }
                             }
@@ -190,19 +248,18 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
             }
-        }
 
-        // Fallback: any text in output[*].content[*]
-        if (root_obj.get("output")) |output_arr| {
+            // Fallback: any text in output[*].content[*]
             for (output_arr.array.items) |item| {
+                if (item != .object) continue;
                 if (item.object.get("content")) |content_arr| {
+                    if (content_arr != .array) continue;
                     for (content_arr.array.items) |content| {
+                        if (content != .object) continue;
                         if (content.object.get("text")) |text| {
                             if (text == .string) {
                                 const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
-                                if (trimmed.len > 0) {
-                                    return try allocator.dupe(u8, trimmed);
-                                }
+                                if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
                             }
                         }
                     }
@@ -211,6 +268,176 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         return error.NoResponseContent;
+    }
+
+    fn parseResponsesJsonText(allocator: std.mem.Allocator, json_body: []const u8) ![]const u8 {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.NoResponseContent;
+
+        const root_obj = parsed.value.object;
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
+        return extractResponsesText(allocator, json_body);
+    }
+
+    fn extractResponsesTextFromSseBody(allocator: std.mem.Allocator, sse_body: []const u8) ![]const u8 {
+        var latest_text: ?[]const u8 = null;
+        errdefer if (latest_text) |txt| allocator.free(txt);
+        var first_err: ?anyerror = null;
+
+        var line_it = std.mem.splitScalar(u8, sse_body, '\n');
+        while (line_it.next()) |raw_line| {
+            const line = std.mem.trimRight(u8, raw_line, "\r");
+            if (!std.mem.startsWith(u8, line, "data:")) continue;
+            const data = std.mem.trimLeft(u8, line["data:".len..], " ");
+            if (data.len == 0) continue;
+            if (std.mem.eql(u8, data, "[DONE]")) break;
+
+            const text = parseResponsesJsonText(allocator, data) catch |err| {
+                if (err != error.NoResponseContent and first_err == null) first_err = err;
+                continue;
+            };
+            if (latest_text) |prev| allocator.free(prev);
+            latest_text = text;
+        }
+
+        if (latest_text) |txt| return txt;
+        if (first_err) |err| return err;
+        return error.NoResponseContent;
+    }
+
+    fn extractResponsesTextAnyBody(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return error.NoResponseContent;
+        if (trimmed[0] == '{') {
+            return parseResponsesJsonText(allocator, trimmed);
+        }
+        return extractResponsesTextFromSseBody(allocator, trimmed);
+    }
+
+    fn appendResponsesContentPart(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        part: ContentPart,
+    ) !void {
+        switch (part) {
+            .text => |text| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":");
+                try root.appendJsonString(buf, allocator, text);
+                try buf.append(allocator, '}');
+            },
+            .image_url => |img| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":");
+                try root.appendJsonString(buf, allocator, img.url);
+                if (img.detail != .auto) {
+                    try buf.appendSlice(allocator, ",\"detail\":\"");
+                    try buf.appendSlice(allocator, img.detail.toSlice());
+                    try buf.append(allocator, '"');
+                }
+                try buf.append(allocator, '}');
+            },
+            .image_base64 => |img| {
+                const data_uri = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ img.media_type, img.data });
+                defer allocator.free(data_uri);
+                try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":");
+                try root.appendJsonString(buf, allocator, data_uri);
+                try buf.append(allocator, '}');
+            },
+        }
+    }
+
+    fn appendResponsesInputMessage(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        msg: ChatMessage,
+    ) !void {
+        const role_str = switch (msg.role) {
+            .assistant => "assistant",
+            .tool => "user",
+            else => msg.role.toSlice(),
+        };
+        try buf.appendSlice(allocator, "{\"role\":\"");
+        try buf.appendSlice(allocator, role_str);
+        try buf.appendSlice(allocator, "\",\"content\":[");
+
+        var wrote_part = false;
+        if (msg.content_parts) |parts| {
+            for (parts) |part| {
+                if (wrote_part) try buf.append(allocator, ',');
+                try appendResponsesContentPart(buf, allocator, part);
+                wrote_part = true;
+            }
+        }
+        if (!wrote_part) {
+            try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":");
+            try root.appendJsonString(buf, allocator, msg.content);
+            try buf.append(allocator, '}');
+        }
+        try buf.appendSlice(allocator, "]}");
+    }
+
+    fn buildResponsesChatRequestBody(
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        merge_system: bool,
+    ) ![]const u8 {
+        _ = merge_system;
+
+        var system_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer system_buf.deinit(allocator);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"input\":[");
+
+        var wrote_message = false;
+        for (request.messages) |msg| {
+            if (msg.role == .system) {
+                if (msg.content.len > 0) {
+                    if (system_buf.items.len > 0) try system_buf.appendSlice(allocator, "\n");
+                    try system_buf.appendSlice(allocator, msg.content);
+                }
+                continue;
+            }
+
+            if (wrote_message) try buf.append(allocator, ',');
+            try appendResponsesInputMessage(&buf, allocator, msg);
+            wrote_message = true;
+        }
+
+        if (!wrote_message) {
+            try buf.appendSlice(allocator, "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"}]}");
+        }
+
+        try buf.append(allocator, ']');
+
+        if (system_buf.items.len > 0) {
+            try buf.appendSlice(allocator, ",\"instructions\":");
+            try root.appendJsonString(&buf, allocator, system_buf.items);
+        }
+
+        if (request.reasoning_effort) |effort| {
+            try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
+            try root.appendJsonString(&buf, allocator, effort);
+            try buf.append(allocator, '}');
+        }
+
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
+        }
+
+        try buf.appendSlice(allocator, ",\"stream\":true,\"store\":false}");
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Chat via the Responses API endpoint (fallback when chat completions returns 404).
@@ -239,7 +466,40 @@ pub const OpenAiCompatibleProvider = struct {
         } else root.curlPost(allocator, url, body, &.{}) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return extractResponsesText(allocator, resp_body);
+        return extractResponsesTextAnyBody(allocator, resp_body);
+    }
+
+    fn chatViaResponsesRequest(
+        self: OpenAiCompatibleProvider,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+    ) !ChatResponse {
+        const url = try self.responsesUrl(allocator);
+        defer allocator.free(url);
+
+        const body = try buildResponsesChatRequestBody(allocator, request, model, self.merge_system_into_user);
+        defer allocator.free(body);
+
+        const auth = try self.authHeaderValue(allocator);
+        defer if (auth) |a| {
+            if (a.needs_free) allocator.free(a.value);
+        };
+
+        const resp_body = if (auth) |a| blk: {
+            var auth_hdr_buf: [512]u8 = undefined;
+            const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
+            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch return error.CompatibleApiError;
+        } else root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.CompatibleApiError;
+        defer allocator.free(resp_body);
+
+        const content = try extractResponsesTextAnyBody(allocator, resp_body);
+        return .{
+            .content = content,
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, model),
+        };
     }
 
     /// Build a chat request JSON body.
@@ -432,6 +692,19 @@ pub const OpenAiCompatibleProvider = struct {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
 
+        if (self.wire_api == .responses_stream) {
+            const response = try self.chatViaResponsesRequest(allocator, request, effective_model);
+            if (response.content) |content| {
+                if (content.len > 0) callback(callback_ctx, root.StreamChunk.textDelta(content));
+            }
+            callback(callback_ctx, root.StreamChunk.finalChunk());
+            return .{
+                .content = response.content,
+                .usage = response.usage,
+                .model = response.model,
+            };
+        }
+
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
@@ -452,8 +725,9 @@ pub const OpenAiCompatibleProvider = struct {
         return sse.curlStream(allocator, url, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
     }
 
-    fn supportsStreamingImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return self.wire_api != .responses_stream;
     }
 
     fn chatWithSystemImpl(
@@ -466,6 +740,10 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror![]const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+
+        if (self.wire_api == .responses_stream) {
+            return self.chatViaResponses(allocator, system_prompt, message, effective_model);
+        }
 
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
@@ -517,6 +795,10 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!ChatResponse {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+
+        if (self.wire_api == .responses_stream) {
+            return self.chatViaResponsesRequest(allocator, request, effective_model);
+        }
 
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
@@ -945,6 +1227,24 @@ test "extractResponsesText top-level output_text" {
     try std.testing.expectEqualStrings("Hello from top-level", result);
 }
 
+test "extractResponsesText wrapped top-level output_text" {
+    const body =
+        \\{"response":{"output_text":"Wrapped hello","output":[]}}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Wrapped hello", result);
+}
+
+test "extractResponsesText wrapped nested output_text type" {
+    const body =
+        \\{"response":{"output":[{"content":[{"type":"output_text","text":"Wrapped nested"}]}]}}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Wrapped nested", result);
+}
+
 test "extractResponsesText nested output_text type" {
     const body =
         \\{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}
@@ -952,6 +1252,14 @@ test "extractResponsesText nested output_text type" {
     const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("Hello from nested", result);
+}
+
+test "parseWireApi defaults and aliases" {
+    try std.testing.expectEqual(.chat_completions, parseWireApi(null));
+    try std.testing.expectEqual(.chat_completions, parseWireApi("chat_completions"));
+    try std.testing.expectEqual(.responses_stream, parseWireApi("responses"));
+    try std.testing.expectEqual(.responses_stream, parseWireApi("responses_stream"));
+    try std.testing.expectEqual(.responses_stream, parseWireApi("  ReSpOnSeS  "));
 }
 
 test "extractResponsesText fallback any text" {

@@ -153,6 +153,15 @@ pub const Config = struct {
         return null;
     }
 
+    /// Look up a provider's wire_api from the providers list.
+    /// Null means the default chat/completions protocol.
+    pub fn getProviderWireApi(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.wire_api;
+        }
+        return null;
+    }
+
     /// Look up whether a provider supports native tool calls.
     /// Returns true (default) if provider is not in the list.
     pub fn getProviderNativeTools(self: *const Config, name: []const u8) bool {
@@ -481,6 +490,13 @@ pub const Config = struct {
                     if (has_field) try w.print(", ", .{});
                     try w.print("\"base_url\": \"{s}\"", .{base});
                     has_field = true;
+                }
+                if (comptime @hasField(ProviderEntry, "wire_api")) {
+                    if (entry.wire_api) |wire_api| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"wire_api\": \"{s}\"", .{wire_api});
+                        has_field = true;
+                    }
                 }
                 if (comptime @hasField(ProviderEntry, "native_tools")) {
                     if (!entry.native_tools) {
@@ -825,6 +841,7 @@ test "json parse roundtrip" {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.wire_api) |wa| allocator.free(wa);
     }
     allocator.free(cfg.providers);
     allocator.free(cfg.memory.backend);
@@ -2139,20 +2156,25 @@ test "json parse mcp_servers with env" {
 test "json parse providers section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"models": {"providers": {"openrouter": {"api_key": "sk-or-abc"}, "groq": {"api_key": "gsk_123", "base_url": "https://custom.groq.dev"}}}}
+        \\{"models": {"providers": {"openrouter": {"api_key": "sk-or-abc"}, "groq": {"api_key": "gsk_123", "base_url": "https://custom.groq.dev"}, "cch": {"api_key": "sk-cch", "base_url": "https://api.asxs.top/v1", "wire_api": "responses"}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqual(@as(usize, 3), cfg.providers.len);
     try std.testing.expectEqualStrings("sk-or-abc", cfg.getProviderKey("openrouter").?);
     try std.testing.expectEqualStrings("gsk_123", cfg.getProviderKey("groq").?);
+    try std.testing.expectEqualStrings("sk-cch", cfg.getProviderKey("cch").?);
     try std.testing.expectEqualStrings("https://custom.groq.dev", cfg.getProviderBaseUrl("groq").?);
+    try std.testing.expectEqualStrings("https://api.asxs.top/v1", cfg.getProviderBaseUrl("cch").?);
     try std.testing.expect(cfg.getProviderBaseUrl("openrouter") == null);
+    try std.testing.expect(cfg.getProviderWireApi("openrouter") == null);
+    try std.testing.expectEqualStrings("responses", cfg.getProviderWireApi("cch").?);
     // Cleanup
     for (cfg.providers) |e| {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.wire_api) |wa| allocator.free(wa);
     }
     allocator.free(cfg.providers);
 }
@@ -2190,6 +2212,40 @@ test "save writes provider native_tools when false" {
     defer allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"native_tools\": false") != null);
+}
+
+test "save writes provider wire_api when configured" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "cch",
+            .api_key = "sk_test",
+            .base_url = "https://api.asxs.top/v1",
+            .wire_api = "responses",
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"wire_api\": \"responses\"") != null);
 }
 
 test "json parse tools.media.audio section" {
@@ -2257,6 +2313,7 @@ test "defaultProviderKey returns key for default provider" {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.wire_api) |wa| allocator.free(wa);
     }
     allocator.free(cfg.providers);
 }

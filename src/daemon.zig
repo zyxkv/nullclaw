@@ -635,7 +635,12 @@ fn inboundDispatcherThread(
         );
 
         const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
-            log.warn("inbound dispatch process failed: {}", .{err});
+            const session_hash = std.hash.Wyhash.hash(0, session_key);
+            const content_hash = std.hash.Wyhash.hash(0, msg.content);
+            log.warn(
+                "inbound dispatch process failed: {} channel={s} chat_id={s} session=0x{x} bytes={d} content_hash=0x{x}",
+                .{ err, msg.channel, msg.chat_id, session_hash, msg.content.len, content_hash },
+            );
 
             // Send user-visible error reply back to the originating channel
             const err_msg: []const u8 = switch (err) {

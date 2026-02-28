@@ -38,6 +38,8 @@ pub const ProviderEntry = struct {
     name: []const u8,
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
+    /// Provider wire protocol: null (default chat/completions) or "responses".
+    wire_api: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// Set to false to use XML tool format via system prompt instead.
     native_tools: bool = true,
@@ -284,7 +286,7 @@ pub const LarkConfig = struct {
     verification_token: ?[]const u8 = null,
     use_feishu: bool = false,
     allow_from: []const []const u8 = &.{},
-    receive_mode: LarkReceiveMode = .websocket,
+    receive_mode: LarkReceiveMode = .webhook,
     port: ?u16 = null,
 };
 

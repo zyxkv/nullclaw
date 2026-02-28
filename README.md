@@ -205,7 +205,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
       "groq": { "api_key": "gsk_..." },
-      "anthropic": { "api_key": "sk-ant-...", "base_url": "https://api.anthropic.com" }
+      "anthropic": { "api_key": "sk-ant-...", "base_url": "https://api.anthropic.com" },
+      "cch": { "api_key": "sk-cch-...", "base_url": "https://api.asxs.top/v1", "wire_api": "responses" }
     }
   },
 

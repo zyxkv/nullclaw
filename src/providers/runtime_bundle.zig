@@ -38,12 +38,13 @@ pub const RuntimeProviderBundle = struct {
 
         const primary_holder = try allocator.create(ProviderHolder);
         bundle.primary_holder = primary_holder;
-        primary_holder.* = ProviderHolder.fromConfig(
+        primary_holder.* = ProviderHolder.fromConfigWithWireApi(
             allocator,
             cfg.default_provider,
             bundle.primary_key,
             cfg.getProviderBaseUrl(cfg.default_provider),
             cfg.getProviderNativeTools(cfg.default_provider),
+            cfg.getProviderWireApi(cfg.default_provider),
         );
 
         const allows_key_rotation = factory.classifyProvider(cfg.default_provider) != .openai_codex_provider;
@@ -82,12 +83,13 @@ pub const RuntimeProviderBundle = struct {
                     cfg.providers,
                 ) catch null;
                 bundle.extra_keys.?[extra_i] = fb_key;
-                bundle.extra_holders.?[extra_i] = ProviderHolder.fromConfig(
+                bundle.extra_holders.?[extra_i] = ProviderHolder.fromConfigWithWireApi(
                     allocator,
                     provider_name,
                     fb_key,
                     cfg.getProviderBaseUrl(provider_name),
                     cfg.getProviderNativeTools(provider_name),
+                    cfg.getProviderWireApi(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -107,12 +109,13 @@ pub const RuntimeProviderBundle = struct {
 
                     const key_copy = try allocator.dupe(u8, trimmed);
                     bundle.extra_keys.?[extra_i] = key_copy;
-                    bundle.extra_holders.?[extra_i] = ProviderHolder.fromConfig(
+                    bundle.extra_holders.?[extra_i] = ProviderHolder.fromConfigWithWireApi(
                         allocator,
                         cfg.default_provider,
                         key_copy,
                         cfg.getProviderBaseUrl(cfg.default_provider),
                         cfg.getProviderNativeTools(cfg.default_provider),
+                        cfg.getProviderWireApi(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{
